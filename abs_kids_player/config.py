@@ -18,8 +18,20 @@ SCREEN_SAVER_MODES = (SCREEN_SAVER_CHAPTER, SCREEN_SAVER_BOOKS, SCREEN_SAVER_CLO
 LIBRARY_SORT_TITLE = "title"
 LIBRARY_SORT_AUTHOR = "author"
 LIBRARY_SORT_MODES = (LIBRARY_SORT_TITLE, LIBRARY_SORT_AUTHOR)
+ROOT_MENU_IDS = ("continue", "series", "title", "author", "bluetooth", "shutdown")
+DEFAULT_ROOT_MENU_ORDER = ROOT_MENU_IDS
+DEFAULT_ROOT_MENU_ENABLED = ROOT_MENU_IDS
+NAV_ACCELERATION_MODES = ("off", *(f"{multiplier}x" for multiplier in range(2, 11)))
+DEFAULT_NAV_ACCELERATION_MODE = "10x"
 PLAYBACK_SPEEDS = (1.0, 1.5, 2.0)
 DEFAULT_PLAYBACK_SPEED = 1.0
+DEFAULT_KNOB_HOLD_SECONDS = 1.0
+DEFAULT_MARQUEE_DELAY_SECONDS = 0.15
+DEFAULT_MARQUEE_SPEED_PX_PER_SECOND = 48.0
+DEFAULT_MARQUEE_LOOP_PAUSE_SECONDS = 2.0
+DEFAULT_NAV_ACCEL_THRESHOLD_MILLISECONDS = 40
+DEFAULT_BROWSE_RETURN_SECONDS = 10.0
+DEFAULT_SCREEN_SAVER_IDLE_SECONDS = 300.0
 SCREEN_SAVER_DIM_LEVELS = (10, 15, 20, 25, 35, 50)
 DEFAULT_SCREEN_SAVER_DIM_PERCENT = 15
 DEFAULT_SLEEP_TIMER_MINUTES = 30
@@ -52,6 +64,17 @@ class AppConfig:
     spoken_navigation_enabled: bool = False
     library_sort_mode: str = LIBRARY_SORT_TITLE
     playback_speed: float = DEFAULT_PLAYBACK_SPEED
+    knob_hold_seconds: float = DEFAULT_KNOB_HOLD_SECONDS
+    marquee_delay_seconds: float = DEFAULT_MARQUEE_DELAY_SECONDS
+    marquee_speed_px_per_second: float = DEFAULT_MARQUEE_SPEED_PX_PER_SECOND
+    marquee_loop_pause_seconds: float = DEFAULT_MARQUEE_LOOP_PAUSE_SECONDS
+    navigation_acceleration_mode: str = DEFAULT_NAV_ACCELERATION_MODE
+    navigation_accel_threshold_milliseconds: int = DEFAULT_NAV_ACCEL_THRESHOLD_MILLISECONDS
+    startup_resume_last_played: bool = False
+    browse_return_seconds: float = DEFAULT_BROWSE_RETURN_SECONDS
+    screen_saver_idle_seconds: float = DEFAULT_SCREEN_SAVER_IDLE_SECONDS
+    root_menu_order: list[str] = field(default_factory=lambda: list(DEFAULT_ROOT_MENU_ORDER))
+    root_menu_enabled: list[str] = field(default_factory=lambda: list(DEFAULT_ROOT_MENU_ENABLED))
     screen_saver_mode: str = SCREEN_SAVER_CHAPTER
     screen_saver_dim_percent: int = DEFAULT_SCREEN_SAVER_DIM_PERCENT
     sleep_timer_enabled: bool = False
@@ -74,6 +97,31 @@ def load_config() -> AppConfig:
         except (OSError, json.JSONDecodeError):
             return AppConfig()
 
+    legacy_acceleration_mode = str(data.get("navigation_acceleration_mode", "")).strip().lower()
+    legacy_threshold_key = {
+        "5x": "navigation_accel_5x_milliseconds",
+        "10x": "navigation_accel_10x_milliseconds",
+    }.get(legacy_acceleration_mode)
+    threshold_value = data.get("navigation_accel_threshold_milliseconds")
+    if threshold_value is None:
+        threshold_value = data.get(legacy_threshold_key) if legacy_threshold_key else None
+
+    raw_root_menu_order = data.get("root_menu_order")
+    root_menu_order = valid_root_menu_order(raw_root_menu_order)
+    root_menu_enabled_value = data.get("root_menu_enabled")
+    raw_order_has_shutdown = isinstance(raw_root_menu_order, (list, tuple)) and any(
+        str(item).strip().lower() == "shutdown" for item in raw_root_menu_order
+    )
+    if not raw_order_has_shutdown:
+        if root_menu_enabled_value is None:
+            root_menu_enabled_value = list(DEFAULT_ROOT_MENU_ENABLED)
+        existing_enabled = root_menu_enabled_value if isinstance(root_menu_enabled_value, (list, tuple)) else ()
+        root_menu_enabled_value = [*existing_enabled, "shutdown"]
+    legacy_knob_hold = max(
+        valid_long_press_seconds(data.get("nav_hold_seconds"), DEFAULT_KNOB_HOLD_SECONDS),
+        valid_long_press_seconds(data.get("volume_hold_seconds"), DEFAULT_KNOB_HOLD_SECONDS),
+    )
+
     return AppConfig(
         server_url=str(data.get("server_url", "")),
         token=str(data.get("token", "")),
@@ -84,6 +132,19 @@ def load_config() -> AppConfig:
         spoken_navigation_enabled=bool(data.get("spoken_navigation_enabled", False)),
         library_sort_mode=valid_library_sort_mode(str(data.get("library_sort_mode", ""))),
         playback_speed=valid_playback_speed(data.get("playback_speed")),
+        knob_hold_seconds=valid_long_press_seconds(data.get("knob_hold_seconds"), legacy_knob_hold),
+        marquee_delay_seconds=valid_marquee_delay(data.get("marquee_delay_seconds")),
+        marquee_speed_px_per_second=valid_marquee_speed(data.get("marquee_speed_px_per_second")),
+        marquee_loop_pause_seconds=valid_marquee_loop_pause(data.get("marquee_loop_pause_seconds")),
+        navigation_acceleration_mode=valid_navigation_acceleration_mode(data.get("navigation_acceleration_mode")),
+        navigation_accel_threshold_milliseconds=valid_acceleration_milliseconds(
+            threshold_value, DEFAULT_NAV_ACCEL_THRESHOLD_MILLISECONDS
+        ),
+        startup_resume_last_played=bool(data.get("startup_resume_last_played", False)),
+        browse_return_seconds=valid_browse_return_seconds(data.get("browse_return_seconds")),
+        screen_saver_idle_seconds=valid_screen_saver_idle_seconds(data.get("screen_saver_idle_seconds")),
+        root_menu_order=root_menu_order,
+        root_menu_enabled=valid_root_menu_enabled(root_menu_enabled_value),
         screen_saver_mode=valid_screen_saver_mode(str(data.get("screen_saver_mode", ""))),
         screen_saver_dim_percent=valid_screen_saver_dim_percent(data.get("screen_saver_dim_percent")),
         sleep_timer_enabled=bool(data.get("sleep_timer_enabled", False)),
@@ -166,6 +227,89 @@ def valid_playback_speed(value: object) -> float:
     except (TypeError, ValueError):
         return DEFAULT_PLAYBACK_SPEED
     return speed if speed in PLAYBACK_SPEEDS else DEFAULT_PLAYBACK_SPEED
+
+
+def valid_long_press_seconds(value: object, fallback: float) -> float:
+    try:
+        seconds = float(value)
+    except (TypeError, ValueError):
+        return fallback
+    return round(min(max(seconds, 0.5), 5.0), 1)
+
+
+def valid_marquee_delay(value: object) -> float:
+    try:
+        seconds = float(value)
+    except (TypeError, ValueError):
+        return DEFAULT_MARQUEE_DELAY_SECONDS
+    return round(min(max(seconds, 0.0), 5.0), 2)
+
+
+def valid_marquee_speed(value: object) -> float:
+    try:
+        speed = float(value)
+    except (TypeError, ValueError):
+        return DEFAULT_MARQUEE_SPEED_PX_PER_SECOND
+    return round(min(max(speed, 8.0), 120.0), 1)
+
+
+def valid_marquee_loop_pause(value: object) -> float:
+    try:
+        seconds = float(value)
+    except (TypeError, ValueError):
+        return DEFAULT_MARQUEE_LOOP_PAUSE_SECONDS
+    return round(min(max(seconds, 0.0), 10.0), 1)
+
+
+def valid_navigation_acceleration_mode(value: object) -> str:
+    mode = str(value or "").strip().lower()
+    return mode if mode in NAV_ACCELERATION_MODES else DEFAULT_NAV_ACCELERATION_MODE
+
+
+def valid_acceleration_milliseconds(value: object, fallback: int) -> int:
+    try:
+        milliseconds = int(value)
+    except (TypeError, ValueError):
+        return fallback
+    return min(max(milliseconds, 10), 500)
+
+
+def valid_browse_return_seconds(value: object) -> float:
+    try:
+        seconds = float(value)
+    except (TypeError, ValueError):
+        return DEFAULT_BROWSE_RETURN_SECONDS
+    return round(min(max(seconds, 0.0), 120.0), 1)
+
+
+def valid_screen_saver_idle_seconds(value: object) -> float:
+    try:
+        seconds = float(value)
+    except (TypeError, ValueError):
+        return DEFAULT_SCREEN_SAVER_IDLE_SECONDS
+    return round(min(max(seconds, 0.0), 3600.0), 1)
+
+
+def valid_root_menu_order(value: object) -> list[str]:
+    candidates = value if isinstance(value, (list, tuple)) else ()
+    ordered: list[str] = []
+    for item in candidates:
+        key = str(item).strip().lower()
+        if key in ROOT_MENU_IDS and key not in ordered:
+            ordered.append(key)
+    return [*ordered, *(key for key in DEFAULT_ROOT_MENU_ORDER if key not in ordered)]
+
+
+def valid_root_menu_enabled(value: object) -> list[str]:
+    candidates = value if isinstance(value, (list, tuple)) else DEFAULT_ROOT_MENU_ENABLED
+    enabled: list[str] = []
+    for item in candidates:
+        key = str(item).strip().lower()
+        if key in ROOT_MENU_IDS and key not in enabled:
+            enabled.append(key)
+    if not enabled:
+        enabled.append("title")
+    return enabled
 
 
 def valid_screen_saver_dim_percent(value: object) -> int:

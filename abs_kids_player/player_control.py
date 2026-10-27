@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import threading
 import time
 import uuid
 from dataclasses import asdict, dataclass
@@ -14,12 +15,14 @@ from .storage import ensure_storage_directory, finalize_storage_file
 STATE_DIR = Path.home() / ".local" / "state" / "abs-kids-player"
 STATUS_PATH = STATE_DIR / "web-player-status.json"
 COMMANDS_PATH = STATE_DIR / "web-player-commands.json"
+BLUETOOTH_DEVICES_PATH = STATE_DIR / "web-bluetooth-devices.json"
 
 
 @dataclass(frozen=True)
 class WebPlayerStatus:
     title: str = ""
     author: str = ""
+    book_id: str = ""
     current_time: float = 0
     duration: float = 0
     is_playing: bool = False
@@ -36,6 +39,11 @@ class WebPlayerStatus:
 class WebPlayerCommand:
     action: str
     value: int | None = None
+    book_id: str = ""
+    start_over: bool = False
+    resume_time: float | None = None
+    device_address: str = ""
+    device_name: str = ""
     id: str = ""
     created_at: float = 0
 
@@ -58,6 +66,7 @@ def load_web_player_status() -> WebPlayerStatus:
     return WebPlayerStatus(
         title=str(data.get("title", "")),
         author=str(data.get("author", "")),
+        book_id=str(data.get("book_id", "")),
         current_time=float(data.get("current_time") or 0),
         duration=float(data.get("duration") or 0),
         is_playing=bool(data.get("is_playing")),
@@ -67,10 +76,24 @@ def load_web_player_status() -> WebPlayerStatus:
     )
 
 
-def queue_web_player_command(action: str, value: int | None = None) -> WebPlayerCommand:
+def queue_web_player_command(
+    action: str,
+    value: int | None = None,
+    *,
+    book_id: str = "",
+    start_over: bool = False,
+    resume_time: float | None = None,
+    device_address: str = "",
+    device_name: str = "",
+) -> WebPlayerCommand:
     command = WebPlayerCommand(
         action=action,
         value=value,
+        book_id=book_id,
+        start_over=start_over,
+        resume_time=resume_time,
+        device_address=device_address,
+        device_name=device_name,
         id=uuid.uuid4().hex,
         created_at=time.time(),
     )
@@ -85,6 +108,11 @@ def consume_web_player_commands() -> list[WebPlayerCommand]:
         WebPlayerCommand(
             action=str(item.get("action", "")),
             value=item.get("value") if isinstance(item.get("value"), int) else None,
+            book_id=str(item.get("book_id", "")),
+            start_over=bool(item.get("start_over", False)),
+            resume_time=optional_float(item.get("resume_time")),
+            device_address=str(item.get("device_address", "")),
+            device_name=str(item.get("device_name", "")),
             id=str(item.get("id", "")),
             created_at=float(item.get("created_at") or 0),
         )
@@ -130,9 +158,77 @@ def commands_path() -> Path:
     return COMMANDS_PATH
 
 
+def save_web_bluetooth_devices(devices: list[object], scanning: bool = False) -> None:
+    path = bluetooth_devices_path()
+    payload = []
+    for device in devices:
+        if isinstance(device, dict):
+            address = str(device.get("address", "")).strip()
+            name = str(device.get("name", "")).strip()
+        else:
+            address = str(getattr(device, "address", "")).strip()
+            name = str(getattr(device, "name", "")).strip()
+        if address and name:
+            payload.append({"address": address, "name": name})
+    data = {"devices": payload, "updated_at": time.time(), "scanning": bool(scanning)}
+    temporary_path = path.with_name(
+        f".{path.name}.{os.getpid()}.{threading.get_ident()}.tmp"
+    )
+    try:
+        ensure_storage_directory(path.parent)
+        temporary_path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+        finalize_storage_file(temporary_path)
+        temporary_path.replace(path)
+        finalize_storage_file(path)
+    except OSError as error:
+        print(f"Bluetooth scan results could not be saved: {error}")
+        try:
+            temporary_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+def load_web_bluetooth_devices() -> dict[str, Any]:
+    try:
+        data = json.loads(bluetooth_devices_path().read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {"devices": [], "updatedAt": 0.0, "scanning": False}
+    devices = data.get("devices", []) if isinstance(data, dict) else []
+    normalized = [
+        {"address": str(item.get("address", "")), "name": str(item.get("name", ""))}
+        for item in devices
+        if isinstance(item, dict) and item.get("address") and item.get("name")
+    ] if isinstance(devices, list) else []
+    try:
+        updated_at = float(data.get("updated_at") or 0) if isinstance(data, dict) else 0.0
+    except (TypeError, ValueError):
+        updated_at = 0.0
+    scanning = bool(data.get("scanning")) if isinstance(data, dict) else False
+    return {"devices": normalized, "updatedAt": updated_at, "scanning": scanning}
+
+
+def bluetooth_devices_path() -> Path:
+    configured_path = os.environ.get("ABS_KIDS_PLAYER_WEB_BLUETOOTH_DEVICES_PATH", "").strip()
+    if configured_path:
+        return Path(configured_path).expanduser()
+    configured_dir = os.environ.get("ABS_KIDS_PLAYER_STATE_DIR", "").strip()
+    if configured_dir:
+        return Path(configured_dir).expanduser() / BLUETOOTH_DEVICES_PATH.name
+    return BLUETOOTH_DEVICES_PATH
+
+
 def clamp_int(value: object, minimum: int, maximum: int, fallback: int) -> int:
     try:
         parsed = int(value)
     except (TypeError, ValueError):
         return fallback
     return min(max(parsed, minimum), maximum)
+
+
+def optional_float(value: object) -> float | None:
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None

@@ -241,14 +241,18 @@ If no library is selected, the player uses the user's default audiobook library 
 
 ## Using The Player
 
-- Turn the Select knob to browse books.
-- Click the Select knob to choose.
+- The root menu starts at `Continue Listening` by default. It lists only in-progress books, sorted by recent progress activity, and excludes finished books.
+- Browse books by series, title, or author from the root menu. Series and author choices open a group list and then its books. Series numbers appear only in the matching series view.
+- Turn the Select knob to browse. Click to choose. Hold it for the configured hold duration (one second by default) to go back one level.
 - Turn the Volume knob to change volume.
-- Click the Volume knob to mute or unmute.
-- Hold the Volume knob for 10 seconds to show the setup address.
+- Click the Volume knob to play or pause and return to the playback screen.
+- Hold the Volume knob for the configured duration to return to the root menu.
+- Hold both knobs together for the configured duration to cleanly shut down the Pi. The gesture works from every screen, whether or not its root-menu instruction is visible. Wait for poweroff before disconnecting power.
+- The Settings tab lets you reorder and hide root-menu items and adjust knob hold time, marquee timing and speed, acceleration, the return-to-playback delay, startup behavior, screen saver, and other player preferences.
+- The Remote Control tab can search and browse the library, start books, control playback and volume, skip chapters, manage Bluetooth audio, and show recent books played on this device.
 - When spoken navigation is enabled, Volume-knob changes are announced at 10% intervals, volume stops at 10%, and pressing the Volume knob does not mute the player.
 
-## Updating Later
+## Updating The Upstream Release
 
 Run the installer again:
 
@@ -257,9 +261,11 @@ curl -fsSL https://raw.githubusercontent.com/chrismtopher/chapter/v0.3.12/script
 sudo reboot
 ```
 
-This reinstalls the tested `v0.3.12` release and refreshes the installed service files. To move to a later release, use the versioned command published for that release. For development builds, the installer also accepts `--release-ref REF` or the `CHAPTER_RELEASE_REF` environment variable.
+This reinstalls the upstream `v0.3.12` release and refreshes the installed service files. To move to a later upstream release, use that release's versioned command. For development builds, the installer also accepts `--release-ref REF` or the `CHAPTER_RELEASE_REF` environment variable.
 
 After installing a release that includes device updates, open the **System** tab on the Chapter administration page. The player checks the public Chapter release tags and offers an **Update** button only when a newer stable version is available. Updating pauses playback, keeps the device configuration and listening state, installs the newest stable release, and restarts the player services. Keep the player powered on and connected to the internet until the administration page becomes available again.
+
+This fork's built-in stable update checker follows `chrismtopher/chapter` releases; fork-specific commits on `douggreer/chapter`'s `main` branch are not published as upstream releases. To deploy those changes to a player, follow the [fork SSH deployment guide](fork-development.md). That workflow replaces the Python package and preserves the device's saved Wi-Fi, Audiobookshelf login, and settings.
 
 ## Troubleshooting
 

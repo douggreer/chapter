@@ -29,7 +29,7 @@ Chapter-Setup
 3. Enter the username and password for the player account.
 4. Submit the form and wait for the player to connect.
 
-After setup is complete, the Chapter Player should show the library or playback screen.
+After setup is complete, the Chapter Player opens `Continue Listening` by default. The setup page can optionally be set to show a resume prompt for the user's latest in-progress book at startup.
 
 ## The Two Knobs
 
@@ -37,23 +37,30 @@ After setup is complete, the Chapter Player should show the library or playback 
 
 - Turn: move through books, menu items, or playback actions.
 - Click: select the highlighted item.
-- Hold for 3 seconds: open the Bluetooth menu.
+- Hold for the configured duration (one second by default): go back one menu level.
 
 ### Volume Knob
 
 - Turn: change volume.
-- Click: mute or unmute.
-- Hold for 10 seconds: show the setup address on the screen.
+- Click: play or pause, then return to the playback screen.
+- Hold for the configured duration: return to the root menu.
+- Hold both knobs together for the configured duration: cleanly shut down the player.
+
+The single knob-hold duration is adjustable in the setup page's Settings tab. The two-knob shutdown gesture works from any screen, even if its instruction is hidden from the root menu. Wait for the player to power off before disconnecting power.
 
 ## Menus And Playback
 
-- In any menu, turn the Select knob to move and click it to choose.
+- The root menu contains Continue Listening, Browse by Series, Browse by Title, Browse by Author, and Bluetooth Settings. Items can be reordered or hidden in the setup page.
+- Continue Listening shows in-progress books, most recently updated first, and does not include finished books.
+- In a series or author group, turn the Select knob to choose a book and click to open it. A series position is shown in the series view.
+- In any menu, turn the Select knob to move, click it to choose, or hold it to go back one level.
 - When choosing a book with listening history, select `Continue` or `Start over`.
-- During playback, use the Select knob to choose `Home`, `Prev`, `Play/Pause`, or `Next`.
+- During playback, use the Select knob to choose `Back`, `Prev`, `Play/Pause`, or `Next`.
 - `Prev` and `Next` may ask you to confirm before changing chapters.
-- In the Bluetooth menu, choose `Enable`, `Disable`, `Pair`, `Unpair`, or `Back`.
+- If a book continues playing while you browse, the display returns to playback after 10 seconds by default.
+- Use Bluetooth Settings to enable or disable Bluetooth, pair a speaker or headphones, or disconnect a paired device.
 - To pair Bluetooth audio, put the speaker or headphones in pairing mode, choose `Pair`, select the device name, and click to connect.
 
 ## If Setup Is Needed Later
 
-Hold the Volume knob for 10 seconds. The Chapter Player will show its setup address on the screen.
+Open the setup page at `http://chapter-player.local` or use the player's IP address. A long hold on the Volume knob returns the OLED to the root menu; it no longer shows the setup address.

@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import unittest
 
-from abs_kids_player.config import LIBRARY_SORT_AUTHOR
 from abs_kids_player.models import AudioTrack, Book, Chapter, PlaybackSession
 from abs_kids_player.player_state import LastPlaybackState
 from abs_kids_player.rotary_ui import (
@@ -20,12 +19,10 @@ from abs_kids_player.rotary_ui import (
     StartupResumeFrame,
     VolumeFrame,
     author_line,
-    author_section_letter,
     author_sort_text,
     marquee_text,
     power_off_resume_time,
     title_sort_text,
-    title_section_letter,
     volume_bar,
 )
 
@@ -39,6 +36,17 @@ BOOKS_WITH_HISTORY = [
     Book("book-1", "The Wild Robot", "Peter Brown", 1000, "", current_time=120, progress=0.12),
     Book("book-2", "Matilda", "Roald Dahl", 1000, ""),
 ]
+
+
+def open_root_view(menu: ApplianceMenu, target: str) -> None:
+    index = next(index for index, entry in enumerate(menu.library_entries) if entry.target == target)
+    menu.rotate_nav(index - menu.library_index, timestamp=1.0)
+    menu.click_nav()
+
+
+def select_book_entry(menu: ApplianceMenu, book_id: str) -> None:
+    index = next(index for index, entry in enumerate(menu.library_entries) if entry.book_id == book_id)
+    menu.rotate_nav(index, timestamp=2.0)
 
 
 def make_session() -> PlaybackSession:
@@ -78,23 +86,108 @@ def make_long_chapter_session() -> PlaybackSession:
 
 
 class ApplianceMenuTest(unittest.TestCase):
+    def setUp(self) -> None:
+        for book in BOOKS:
+            book.current_time = 0
+            book.progress = 0
+            book.finished = False
+            book.last_update = 0
+        BOOKS_WITH_HISTORY[0].current_time = 120
+        BOOKS_WITH_HISTORY[0].progress = 0.12
+        BOOKS_WITH_HISTORY[0].finished = False
+        BOOKS_WITH_HISTORY[0].last_update = 0
+
     def test_library_scrolls_titles_and_authors(self) -> None:
         menu = ApplianceMenu(BOOKS)
         frame = menu.render()
         self.assertIsInstance(frame, HomeFrame)
-        self.assertEqual(frame.top, "The Wild Robot")
-        self.assertEqual(frame.bottom, "By Peter Brown")
+        self.assertEqual(frame.top, "Continue Listening")
+        self.assertEqual(frame.bottom, "0 in progress")
 
-        menu.rotate_nav(1)
+        open_root_view(menu, "title")
 
         frame = menu.render()
         self.assertIsInstance(frame, HomeFrame)
         self.assertEqual(frame.top, "Matilda")
         self.assertEqual(frame.bottom, "By Roald Dahl")
 
+    def test_root_menu_contains_browse_choices_and_bluetooth_settings(self) -> None:
+        menu = ApplianceMenu(BOOKS)
+
+        self.assertEqual(
+            [entry.title for entry in menu.library_entries],
+            ["Continue Listening", "Browse by Series", "Browse by Title", "Browse by Author", "Bluetooth Settings"],
+        )
+
+    def test_continue_listening_excludes_finished_books_and_sorts_by_activity(self) -> None:
+        menu = ApplianceMenu(
+            [
+                Book("older", "Older", "Author", 200, "", current_time=20, progress=0.1, last_update=10),
+                Book("newer", "Newer", "Author", 200, "", current_time=40, progress=0.2, last_update=30),
+                Book("finished", "Finished", "Author", 200, "", current_time=200, progress=1, last_update=40),
+            ]
+        )
+
+        self.assertEqual(menu.library_entries[0].subtitle, "2 in progress")
+        open_root_view(menu, "continue")
+        self.assertEqual([entry.title for entry in menu.library_entries], ["Newer", "Older"])
+
+        frame = menu.render()
+        self.assertEqual(frame.title, "Newer")
+        self.assertEqual(frame.subtitle, "20%  2m left")
+
+    def test_series_and_author_views_show_groups_and_support_back(self) -> None:
+        menu = ApplianceMenu(
+            [
+                Book(
+                    "book-1", "Alpha One", "Author One", 100, "",
+                    series_name="Alpha Series", series_sequence="1",
+                    author_names=("Author One", "Author Two"),
+                ),
+                Book(
+                    "book-2", "Alpha Two", "Author One", 100, "",
+                    series_name="Alpha Series", series_sequence="2",
+                    author_names=("Author One",),
+                ),
+            ]
+        )
+
+        open_root_view(menu, "series")
+        self.assertEqual(
+            [(entry.title, entry.subtitle) for entry in menu.library_entries],
+            [("Alpha Series", "2 books")],
+        )
+        menu.click_nav()
+        self.assertEqual([entry.title for entry in menu.library_entries], ["Alpha One", "Alpha Two"])
+        self.assertEqual(menu.hold_nav(), [])
+        self.assertEqual(menu.library_view, "series")
+        self.assertEqual(menu.hold_nav(), [])
+        self.assertEqual(menu.library_view, "root")
+
+        open_root_view(menu, "author")
+        self.assertEqual(
+            [(entry.title, entry.subtitle) for entry in menu.library_entries],
+            [("Author One", "2 books"), ("Author Two", "1 book")],
+        )
+
+    def test_fast_knob_turn_accelerates_all_library_lists(self) -> None:
+        menu = ApplianceMenu(
+            [Book(f"book-{index}", f"Book {index:02}", "Author", 100, "") for index in range(30)]
+        )
+        open_root_view(menu, "title")
+
+        menu.rotate_nav(1, timestamp=1.0)
+        self.assertEqual(menu.library_index, 1)
+        menu.rotate_nav(1, timestamp=1.02)
+        self.assertEqual(menu.library_index, 11)
+        menu.rotate_nav(1, timestamp=1.09)
+        self.assertEqual(menu.library_index, 12)
+
     def test_spoken_selection_debounces_books_and_names_selected_controls(self) -> None:
         menu = ApplianceMenu(BOOKS_WITH_HISTORY)
 
+        open_root_view(menu, "continue")
+        menu.rotate_nav(1, timestamp=2.0)
         book_selection = menu.spoken_selection()
         self.assertEqual(book_selection.text, "The Wild Robot")
         self.assertGreater(book_selection.delay_seconds, 0)
@@ -110,12 +203,14 @@ class ApplianceMenuTest(unittest.TestCase):
 
     def test_library_marks_podcasts_on_home_frame(self) -> None:
         menu = ApplianceMenu([Book("podcast:yoto-daily", "Yoto Daily", "Yoto", 0, "")])
+        open_root_view(menu, "title")
+        menu.rotate_nav(1, timestamp=2.0)
         frame = menu.render()
 
         self.assertIsInstance(frame, HomeFrame)
         self.assertTrue(frame.is_podcast)
 
-    def test_library_shows_series_position_on_home_frame(self) -> None:
+    def test_library_shows_series_position_only_inside_series(self) -> None:
         book = Book(
             "book-1",
             "The Wild Robot Escapes",
@@ -127,13 +222,22 @@ class ApplianceMenuTest(unittest.TestCase):
             series_total=3,
         )
 
-        frame = ApplianceMenu([book]).render()
+        menu = ApplianceMenu([book])
+        open_root_view(menu, "title")
+        menu.rotate_nav(1, timestamp=2.0)
+        frame = menu.render()
 
         self.assertIsInstance(frame, HomeFrame)
-        self.assertEqual(frame.title, "The Wild Robot: The Wild Robot Escapes")
+        self.assertEqual(frame.title, "The Wild Robot Escapes")
+        self.assertEqual(frame.series_position, "")
+
+        menu.hold_nav()
+        open_root_view(menu, "series")
+        menu.click_nav()
+        frame = menu.render()
         self.assertEqual(frame.series_position, "2/3")
 
-    def test_series_title_is_not_prefixed_twice(self) -> None:
+    def test_display_title_preserves_the_catalog_title(self) -> None:
         book = Book(
             "book-1",
             "The Wild Robot: The Wild Robot Escapes",
@@ -145,44 +249,10 @@ class ApplianceMenuTest(unittest.TestCase):
 
         self.assertEqual(book.display_title, "The Wild Robot: The Wild Robot Escapes")
 
-    def test_library_scroll_shows_section_letter_then_fades(self) -> None:
-        menu = ApplianceMenu(BOOKS)
-
-        menu.rotate_nav(1)
-        frame = menu.render()
-
-        self.assertIsInstance(frame, HomeFrame)
-        self.assertEqual(frame.section_letter, "M")
-        self.assertEqual(frame.section_letter_fill, 255)
-
-        menu.tick_section_letter(0.9)
-        held = menu.render()
-        self.assertIsInstance(held, HomeFrame)
-        self.assertEqual(held.section_letter, "M")
-        self.assertEqual(held.section_letter_fill, 255)
-
-        menu.tick_section_letter(0.3)
-        fading = menu.render()
-        self.assertIsInstance(fading, HomeFrame)
-        self.assertEqual(fading.section_letter, "M")
-        self.assertLess(fading.section_letter_fill, 255)
-        self.assertGreater(fading.section_letter_fill, 0)
-
-        menu.tick_section_letter(1.0)
-        faded = menu.render()
-        self.assertIsInstance(faded, HomeFrame)
-        self.assertEqual(faded.section_letter, "")
-        self.assertEqual(faded.section_letter_fill, 0)
-
-    def test_author_order_scroll_uses_last_name_section_letter(self) -> None:
-        menu = ApplianceMenu(BOOKS, library_sort_mode=LIBRARY_SORT_AUTHOR)
-
-        menu.rotate_nav(1)
-
-        self.assertEqual(menu.render().section_letter, "D")
-
     def test_title_click_without_history_opens_home_start_choice(self) -> None:
         menu = ApplianceMenu(BOOKS)
+        open_root_view(menu, "title")
+        select_book_entry(menu, "book-1")
 
         commands = menu.click_nav()
 
@@ -191,9 +261,9 @@ class ApplianceMenuTest(unittest.TestCase):
         frame = menu.render()
         self.assertIsInstance(frame, ResumeChoiceFrame)
         self.assertEqual(frame.top, "The Wild Robot")
-        self.assertEqual(frame.options, ("Home", "Start"))
+        self.assertEqual(frame.options, ("Back", "Start"))
         self.assertEqual(frame.selected_index, 1)
-        self.assertEqual(frame.bottom, "Home [Start]")
+        self.assertEqual(frame.bottom, "Back [Start]")
 
     def test_startup_resume_prompt_defaults_to_continue(self) -> None:
         menu = ApplianceMenu(BOOKS)
@@ -236,6 +306,8 @@ class ApplianceMenuTest(unittest.TestCase):
 
     def test_title_click_with_history_opens_continue_start_over_choice(self) -> None:
         menu = ApplianceMenu(BOOKS_WITH_HISTORY)
+        open_root_view(menu, "title")
+        select_book_entry(menu, "book-1")
         commands = menu.click_nav()
 
         self.assertEqual(menu.screen, Screen.RESUME_CHOICE)
@@ -243,12 +315,14 @@ class ApplianceMenuTest(unittest.TestCase):
         frame = menu.render()
         self.assertIsInstance(frame, ResumeChoiceFrame)
         self.assertEqual(frame.top, "The Wild Robot")
-        self.assertEqual(frame.options, ("Home", "Continue", "Start over"))
+        self.assertEqual(frame.options, ("Back", "Continue", "Start over"))
         self.assertEqual(frame.selected_index, 1)
-        self.assertEqual(frame.bottom, "Home [Continue] Start over")
+        self.assertEqual(frame.bottom, "Back [Continue] Start over")
 
     def test_continue_is_default_when_history_exists(self) -> None:
         menu = ApplianceMenu(BOOKS_WITH_HISTORY)
+        open_root_view(menu, "title")
+        select_book_entry(menu, "book-1")
         menu.click_nav()
 
         command = menu.click_nav()[0]
@@ -260,6 +334,8 @@ class ApplianceMenuTest(unittest.TestCase):
 
     def test_start_is_default_without_history(self) -> None:
         menu = ApplianceMenu(BOOKS)
+        open_root_view(menu, "title")
+        select_book_entry(menu, "book-1")
         menu.click_nav()
 
         command = menu.click_nav()[0]
@@ -270,13 +346,15 @@ class ApplianceMenuTest(unittest.TestCase):
 
     def test_start_over_can_be_selected_when_history_exists(self) -> None:
         menu = ApplianceMenu(BOOKS_WITH_HISTORY)
+        open_root_view(menu, "title")
+        select_book_entry(menu, "book-1")
         menu.click_nav()
 
         menu.rotate_nav(1)
         frame = menu.render()
         self.assertIsInstance(frame, ResumeChoiceFrame)
         self.assertEqual(frame.selected_index, 2)
-        self.assertEqual(frame.bottom, "Home Continue [Start over]")
+        self.assertEqual(frame.bottom, "Back Continue [Start over]")
 
         command = menu.click_nav()[0]
 
@@ -286,18 +364,21 @@ class ApplianceMenuTest(unittest.TestCase):
 
     def test_home_can_be_selected_from_resume_choice(self) -> None:
         menu = ApplianceMenu(BOOKS_WITH_HISTORY)
+        open_root_view(menu, "title")
+        select_book_entry(menu, "book-1")
         menu.click_nav()
 
         menu.rotate_nav(-1)
         frame = menu.render()
         self.assertIsInstance(frame, ResumeChoiceFrame)
         self.assertEqual(frame.selected_index, 0)
-        self.assertEqual(frame.bottom, "[Home] Continue Start over")
+        self.assertEqual(frame.bottom, "[Back] Continue Start over")
 
-        command = menu.click_nav()[0]
+        commands = menu.click_nav()
 
-        self.assertEqual(command.type, CommandType.HOME)
+        self.assertEqual(commands, [])
         self.assertEqual(menu.screen, Screen.LIBRARY)
+        self.assertEqual(menu.library_view, "title")
 
     def test_playing_click_toggles_play_pause(self) -> None:
         menu = ApplianceMenu(BOOKS)
@@ -306,9 +387,9 @@ class ApplianceMenuTest(unittest.TestCase):
         self.assertEqual(menu.playing_action_index, PLAYING_PLAY_INDEX)
         frame = menu.render()
         self.assertIsInstance(frame, PlayingFrame)
-        self.assertEqual(frame.actions, ("Home", "Prev", "Pause", "Next"))
+        self.assertEqual(frame.actions, ("Back", "Prev", "Pause", "Next"))
         self.assertEqual(frame.selected_index, PLAYING_PLAY_INDEX)
-        self.assertEqual(frame.bottom, "Home Prev [Pause] Next")
+        self.assertEqual(frame.bottom, "Back Prev [Pause] Next")
 
         command = menu.click_nav()[0]
 
@@ -343,6 +424,22 @@ class ApplianceMenuTest(unittest.TestCase):
         self.assertIsInstance(scrolling, PlayingFrame)
         self.assertEqual(waiting.title_scroll_px, 0)
         self.assertEqual(scrolling.title_scroll_px, 16)
+
+    def test_playing_title_uses_configured_marquee_loop_pause(self) -> None:
+        menu = ApplianceMenu(BOOKS)
+        menu.set_session(make_long_chapter_session())
+
+        menu.update_title_scroll(
+            2.0,
+            delay_seconds=1.0,
+            pixels_per_second=10.0,
+            loop_pause_seconds=2.0,
+        )
+        frame = menu.render()
+
+        self.assertIsInstance(frame, PlayingFrame)
+        self.assertEqual(frame.title_scroll_px, 30)
+        self.assertEqual(frame.scroll_pause_px, 20)
 
     def test_playing_title_does_not_scroll_when_short(self) -> None:
         menu = ApplianceMenu(BOOKS)
@@ -391,7 +488,7 @@ class ApplianceMenuTest(unittest.TestCase):
         menu.rotate_nav(-1)
         menu.rotate_nav(-1)
 
-        self.assertIn("[Home]", menu.render().bottom)
+        self.assertIn("[Back]", menu.render().bottom)
 
     def test_selecting_next_chapter_requires_confirmation(self) -> None:
         menu = ApplianceMenu(BOOKS)
@@ -480,92 +577,66 @@ class ApplianceMenuTest(unittest.TestCase):
         self.assertEqual(command.type, CommandType.CONFIRM_STILL_LISTENING)
         self.assertEqual(menu.screen, Screen.PLAYING)
 
-    def test_home_returns_to_library(self) -> None:
+    def test_playing_back_returns_to_selected_book_list_and_keeps_playing(self) -> None:
         menu = ApplianceMenu(BOOKS)
-        menu.set_session(make_session())
-
-        menu.rotate_nav(-1)
-        menu.rotate_nav(-1)
-        command = menu.click_nav()[0]
-
-        self.assertEqual(command.type, CommandType.HOME)
-        self.assertEqual(menu.screen, Screen.LIBRARY)
-
-    def test_home_returns_to_active_playback_after_five_seconds(self) -> None:
-        menu = ApplianceMenu(BOOKS)
+        open_root_view(menu, "title")
+        select_book_entry(menu, "book-1")
         menu.set_session(make_session())
         menu.rotate_nav(-2)
-        menu.click_nav()
 
-        self.assertFalse(menu.tick_home_return_timeout(4.9))
+        commands = menu.click_nav()
+
+        self.assertEqual(commands, [])
         self.assertEqual(menu.screen, Screen.LIBRARY)
-        self.assertTrue(menu.tick_home_return_timeout(0.1))
-        self.assertEqual(menu.screen, Screen.PLAYING)
-        self.assertEqual(menu.playing_action_index, PLAYING_PLAY_INDEX)
+        self.assertEqual(menu.library_view, "title")
+        self.assertEqual(menu.render().title, "The Wild Robot")
+        self.assertIsNotNone(menu.session)
+        self.assertTrue(menu.is_playing)
 
-    def test_home_return_timeout_resets_on_input_activity(self) -> None:
+    def test_one_second_hold_backs_out_of_playing_to_previous_list(self) -> None:
         menu = ApplianceMenu(BOOKS)
+        open_root_view(menu, "title")
+        select_book_entry(menu, "book-1")
         menu.set_session(make_session())
-        menu.rotate_nav(-2)
-        menu.click_nav()
 
-        self.assertFalse(menu.tick_home_return_timeout(4.0))
-        menu.note_input_activity()
-        self.assertFalse(menu.tick_home_return_timeout(4.9))
+        self.assertEqual(menu.hold_nav(), [])
         self.assertEqual(menu.screen, Screen.LIBRARY)
-        self.assertTrue(menu.tick_home_return_timeout(0.1))
-        self.assertEqual(menu.screen, Screen.PLAYING)
-
-    def test_home_does_not_return_to_paused_playback(self) -> None:
-        menu = ApplianceMenu(BOOKS)
-        menu.set_session(make_session(), is_playing=False)
-        menu.rotate_nav(-2)
-        menu.click_nav()
-
-        self.assertFalse(menu.tick_home_return_timeout(10.0))
-        self.assertEqual(menu.screen, Screen.LIBRARY)
-
-    def test_home_return_timeout_stops_if_playback_pauses(self) -> None:
-        menu = ApplianceMenu(BOOKS)
-        menu.set_session(make_session())
-        menu.rotate_nav(-2)
-        menu.click_nav()
-
-        self.assertFalse(menu.tick_home_return_timeout(4.0))
-        menu.update_playback(menu.current_time, is_playing=False)
-        self.assertFalse(menu.tick_home_return_timeout(2.0))
-        self.assertEqual(menu.screen, Screen.LIBRARY)
+        self.assertEqual(menu.library_view, "title")
+        self.assertEqual(menu.render().title, "The Wild Robot")
+        self.assertTrue(menu.is_playing)
 
     def test_volume_encoder_emits_volume_commands(self) -> None:
         menu = ApplianceMenu(BOOKS)
+        menu.set_session(make_session())
 
         volume = menu.rotate_volume(-2)[0]
-        mute = menu.click_volume()[0]
-        show_ip = menu.hold_volume()[0]
+        toggle_playback = menu.click_volume()[0]
+        self.assertEqual(menu.hold_volume(), [])
 
         self.assertEqual(volume.type, CommandType.VOLUME_DELTA)
         self.assertEqual(volume.volume_delta, -2)
-        self.assertEqual(mute.type, CommandType.TOGGLE_MUTE)
-        self.assertEqual(show_ip.type, CommandType.SHOW_IP)
-        self.assertEqual(show_ip.display_seconds, 5)
+        self.assertEqual(toggle_playback.type, CommandType.TOGGLE_PLAYBACK)
+        self.assertEqual(menu.screen, Screen.LIBRARY)
+        self.assertEqual(menu.library_view, "root")
 
-    def test_control_hold_opens_bluetooth_menu(self) -> None:
+    def test_root_bluetooth_settings_opens_bluetooth_menu(self) -> None:
         menu = ApplianceMenu(BOOKS)
+        menu.set_bluetooth_enabled(False)
+        menu.rotate_nav(next(index for index, entry in enumerate(menu.library_entries) if entry.kind == "bluetooth"))
 
-        commands = menu.hold_nav(bluetooth_enabled=True)
+        commands = menu.click_nav()
         frame = menu.render()
 
-        self.assertEqual(len(commands), 1)
-        self.assertEqual(commands[0].type, CommandType.PAUSE_PLAYBACK)
+        self.assertEqual(commands, [])
         self.assertIsInstance(frame, BluetoothMenuFrame)
-        self.assertTrue(frame.enabled)
-        self.assertEqual(frame.options, ("Back", "Disable", "Pair"))
-        self.assertEqual(frame.selected_index, 2)
+        self.assertFalse(frame.enabled)
+        self.assertEqual(frame.options, ("Back", "Enable", "Pair"))
+        self.assertEqual(frame.selected_index, 1)
 
-    def test_control_hold_shows_unpair_when_bluetooth_connected(self) -> None:
+    def test_bluetooth_menu_shows_unpair_when_connected(self) -> None:
         menu = ApplianceMenu(BOOKS)
 
-        menu.hold_nav(bluetooth_enabled=True, bluetooth_connected=True)
+        menu.open_bluetooth_menu(bluetooth_connected=True)
         frame = menu.render()
 
         self.assertIsInstance(frame, BluetoothMenuFrame)
@@ -577,7 +648,7 @@ class ApplianceMenuTest(unittest.TestCase):
 
     def test_bluetooth_menu_can_disable_bluetooth(self) -> None:
         menu = ApplianceMenu(BOOKS)
-        menu.hold_nav(bluetooth_enabled=True)
+        menu.open_bluetooth_menu(bluetooth_enabled=True)
 
         menu.rotate_nav(-1)
         command = menu.click_nav()[0]
@@ -591,7 +662,7 @@ class ApplianceMenuTest(unittest.TestCase):
 
     def test_bluetooth_pair_turns_bluetooth_on_when_disabled(self) -> None:
         menu = ApplianceMenu(BOOKS)
-        menu.hold_nav(bluetooth_enabled=False)
+        menu.open_bluetooth_menu(bluetooth_enabled=False)
 
         menu.rotate_nav(1)
         commands = menu.click_nav()
@@ -687,15 +758,6 @@ class ApplianceMenuTest(unittest.TestCase):
         self.assertEqual(author_line("Peter Brown"), "By Peter Brown")
         self.assertEqual(author_line(""), "")
 
-    def test_title_section_letter_uses_first_title_letter(self) -> None:
-        self.assertEqual(title_section_letter("  the hobbit"), "H")
-        self.assertEqual(title_section_letter("A Wrinkle in Time"), "W")
-        self.assertEqual(title_section_letter("The A Team"), "T")
-        self.assertEqual(title_section_letter("Theodore Boone"), "T")
-        self.assertEqual(title_section_letter("Anansi Boys"), "A")
-        self.assertEqual(title_section_letter("...Matilda"), "M")
-        self.assertEqual(title_section_letter("1984"), "#")
-
     def test_title_sort_text_ignores_leading_articles(self) -> None:
         self.assertEqual(title_sort_text("The Hobbit"), "hobbit")
         self.assertEqual(title_sort_text("A Wrinkle in Time"), "wrinkle in time")
@@ -709,7 +771,6 @@ class ApplianceMenuTest(unittest.TestCase):
         self.assertEqual(author_sort_text("Neil Gaiman & Terry Pratchett"), "gaiman neil")
         self.assertEqual(author_sort_text("Dahl, Roald"), "dahl")
         self.assertEqual(author_sort_text(""), "")
-        self.assertEqual(author_section_letter("Madeleine L'Engle"), "L")
 
     def test_marquee_text_scrolls_with_gap(self) -> None:
         self.assertEqual(marquee_text("Long title", 4, 0), "Long")

@@ -49,6 +49,7 @@ from abs_kids_player.setup_server import (
     save_sleep_timer_setting,
     save_spoken_navigation_setting,
     saved_username,
+    timestamp_seconds,
     SetupHandler,
 )
 from abs_kids_player.wifi import SETUP_HOTSPOT_SSID, WifiStatus
@@ -73,6 +74,21 @@ class FakeAudiobookshelfClient:
 
 
 class SetupServerTest(unittest.TestCase):
+    def test_timestamp_seconds_normalizes_audiobookshelf_milliseconds(self) -> None:
+        self.assertEqual(timestamp_seconds(1_668_586_015_691), 1_668_586_015.691)
+        self.assertEqual(timestamp_seconds(1_668_586_015.691), 1_668_586_015.691)
+
+    def test_navigation_settings_include_runtime_controls_and_default_return_timeout(self) -> None:
+        settings = render_settings_card(AppConfig())
+
+        self.assertIn('name="nav_hold_seconds"', settings)
+        self.assertIn('name="volume_hold_seconds"', settings)
+        self.assertIn('name="marquee_speed_px_per_second"', settings)
+        self.assertIn('name="navigation_acceleration_mode"', settings)
+        self.assertIn('name="browse_return_seconds" type="number" min="0" max="120" step="1" value="10.0"', settings)
+        self.assertIn('name="menu_order_series"', settings)
+        self.assertIn('name="menu_enabled" value="author" checked', settings)
+
     def test_health_page_shows_wifi_and_audiobookshelf_success(self) -> None:
         html = render_health_page(
             WifiStatus(connected=True, ssid="Chapter WiFi"),
@@ -256,13 +272,10 @@ class SetupServerTest(unittest.TestCase):
         self.assertIn("Enable spoken navigation", enabled)
         spoken_enabled = render_settings_card(AppConfig(spoken_navigation_enabled=True))
         self.assertIn("Disable spoken navigation", spoken_enabled)
-        self.assertIn('class="setting-name">Library order</div>', enabled)
-        self.assertNotIn('class="setting-name">Library order</div>\n            <div class="setting-state">', enabled)
-        self.assertIn('action="/settings/library-order"', enabled)
-        self.assertIn('<option value="title" selected>Title</option>', enabled)
+        self.assertNotIn('class="setting-name">Library order</div>', enabled)
 
         author_order = render_settings_card(AppConfig(library_sort_mode=LIBRARY_SORT_AUTHOR))
-        self.assertIn('<option value="author" selected>Author (last name)</option>', author_order)
+        self.assertNotIn('class="setting-name">Library order</div>', author_order)
         self.assertIn('class="setting-name">Playback speed</div>', enabled)
         self.assertIn('action="/settings/playback-speed"', enabled)
         self.assertIn('<option value="1" selected>1x</option>', enabled)

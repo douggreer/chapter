@@ -218,31 +218,23 @@ def make_playback_session() -> PlaybackSession:
 
 
 class OledServiceTest(unittest.TestCase):
-    def test_home_jump_letter_uses_its_own_larger_font_without_moving_content(self) -> None:
+    def test_home_does_not_draw_section_letter_overlay(self) -> None:
         display = object.__new__(Sh1122Display)
         display.draw = Mock()
         display.font_home_title = object()
         display.font_home_author = object()
-        display.font_section_letter = object()
         display.draw_centered_text = Mock()
         display.draw_scrolling_text = Mock()
         display.draw_bottom_left_text = Mock()
-        display.draw_bottom_right_text = Mock()
 
         with (
             patch("abs_kids_player.appliance_io.text_width", return_value=20),
             patch("abs_kids_player.appliance_io.fit_text", side_effect=lambda _draw, text, _font, _width: text),
         ):
-            display.draw_home(HomeFrame("Matilda", "By Roald Dahl", section_letter="M", section_letter_fill=200))
+            display.draw_home(HomeFrame("Matilda", "By Roald Dahl"))
 
         self.assertEqual(display.draw_centered_text.call_args_list[0].kwargs["y"], 12)
         self.assertEqual(display.draw_centered_text.call_args_list[1].kwargs["y"], 34)
-        display.draw_bottom_right_text.assert_called_once_with(
-            "M",
-            display.font_section_letter,
-            fill=200,
-            margin=3,
-        )
 
     def test_oled_text_uses_ascii_apostrophes(self) -> None:
         self.assertEqual(oled_safe_text("Charlotte\u2019s Web"), "Charlotte's Web")
@@ -400,7 +392,7 @@ class OledServiceTest(unittest.TestCase):
             "Yoto Daily",
         ])
 
-    def test_sorted_books_for_menu_uses_series_title(self) -> None:
+    def test_sorted_books_for_menu_uses_plain_title(self) -> None:
         books = sorted_books_for_menu(
             [
                 Book(id="book-2", title="Book Two", author="Author", duration=1, cover_url="", series_name="Zebra Tales"),
@@ -408,7 +400,7 @@ class OledServiceTest(unittest.TestCase):
             ]
         )
 
-        self.assertEqual([book.display_title for book in books], ["Matilda", "Zebra Tales: Book Two"])
+        self.assertEqual([book.display_title for book in books], ["Book Two", "Matilda"])
 
     def test_sorted_books_for_menu_can_order_by_author_last_name(self) -> None:
         books = sorted_books_for_menu(
@@ -598,7 +590,7 @@ class OledServiceTest(unittest.TestCase):
 
         self.assertTrue(changed)
         self.assertFalse(refresh_library)
-        self.assertEqual([book.title for book in menu.books], ["Matilda", "The Hobbit"])
+        self.assertEqual([book.title for book in menu.books], ["The Hobbit", "Matilda"])
         self.assertEqual(menu.library_sort_mode, LIBRARY_SORT_AUTHOR)
         self.assertTrue(playback.is_playing)
         self.assertEqual(playback.pause_calls, 0)
@@ -608,7 +600,7 @@ class OledServiceTest(unittest.TestCase):
     def test_home_title_does_not_scroll_before_delay(self) -> None:
         frame = HomeFrame("A Very Long Audiobook Title", "Author")
 
-        self.assertEqual(scrolled_home_frame(frame, elapsed_seconds=1.9), frame)
+        self.assertEqual(scrolled_home_frame(frame, elapsed_seconds=0.1), frame)
 
     def test_home_title_scrolls_after_delay(self) -> None:
         frame = scrolled_home_frame(
@@ -616,24 +608,31 @@ class OledServiceTest(unittest.TestCase):
                 "A Very Long Audiobook Title",
                 "Author",
                 series_position="2/7",
-                section_letter="A",
-                section_letter_fill=128,
                 is_podcast=True,
             ),
-            elapsed_seconds=3.0,
+            elapsed_seconds=0.5,
+            loop_pause_seconds=0.0,
         )
 
         self.assertIsInstance(frame, HomeFrame)
         self.assertTrue(frame.title_scrolling)
-        self.assertEqual(frame.title_scroll_px, 16)
-        self.assertEqual(frame.section_letter, "A")
-        self.assertEqual(frame.section_letter_fill, 128)
+        self.assertEqual(frame.title_scroll_px, 17)
         self.assertEqual(frame.series_position, "2/7")
         self.assertTrue(frame.is_podcast)
 
+    def test_home_title_applies_configured_pause_between_scroll_loops(self) -> None:
+        frame = scrolled_home_frame(
+            HomeFrame("A Very Long Audiobook Title", "Author"),
+            elapsed_seconds=0.5,
+            loop_pause_seconds=2.0,
+        )
+
+        self.assertEqual(frame.title_scroll_px, 113)
+        self.assertEqual(frame.scroll_pause_px, 96)
+
     def test_home_cache_refresh_keeps_scroll_timer_when_book_is_same(self) -> None:
         old = HomeFrame("A Very Long Audiobook Title", "Author")
-        new = HomeFrame("A Very Long Audiobook Title", "Author", section_letter="A", section_letter_fill=128)
+        new = HomeFrame("A Very Long Audiobook Title", "Author")
 
         frame, loaded_at = refresh_home_cache(old, new, home_frame_loaded_at=12.0, now=99.0)
 
@@ -732,7 +731,7 @@ class OledServiceTest(unittest.TestCase):
 
         self.assertEqual(
             screen_saver_words_for_mode(SCREEN_SAVER_BOOKS, books),
-            ("The Hobbit", "The Wild Robot: The Wild Robot Escapes"),
+            ("The Hobbit", "The Wild Robot Escapes"),
         )
         self.assertEqual(screen_saver_words_for_mode(SCREEN_SAVER_BOOKS, []), ("chapter",))
 
@@ -906,23 +905,19 @@ class OledServiceTest(unittest.TestCase):
         self.assertEqual(percent, 55)
         self.assertFalse(muted)
 
-    def test_volume_click_fallback_shows_muted_without_zeroing_percent(self) -> None:
+    def test_volume_click_fallback_does_not_change_volume_state(self) -> None:
         events = queue.SimpleQueue()
         events.put(InputEvent("volume_click"))
 
-        with patch("abs_kids_player.oled_service.toggle_mute", side_effect=AudioError("missing audio")):
-            frame, percent, muted = handle_input_events_with_fallback(
-                events,
-                fallback_percent=50,
-                fallback_muted=False,
-            )
+        frame, percent, muted = handle_input_events_with_fallback(
+            events,
+            fallback_percent=50,
+            fallback_muted=False,
+        )
 
-        self.assertIsInstance(frame, VolumeFrame)
-        self.assertEqual(frame.percent, 50)
-        self.assertEqual(frame.top, "Muted")
-        self.assertTrue(frame.is_muted)
+        self.assertIsNone(frame)
         self.assertEqual(percent, 50)
-        self.assertTrue(muted)
+        self.assertFalse(muted)
 
     def test_mute_indicator_is_added_to_non_volume_frames_only(self) -> None:
         home = frame_with_mute_indicator(HomeFrame("Matilda", "Roald Dahl"), muted=True)
@@ -1150,6 +1145,8 @@ class OledServiceTest(unittest.TestCase):
                 Book(id="book-2", title="Matilda", author="Roald Dahl", duration=1, cover_url=""),
             ]
         )
+        menu.rotate_nav(2, timestamp=1.0)
+        menu.click_nav()
 
         _frame, _percent, _muted, changed, commands, pause_playback, resume_playback = handle_oled_input_events(
             events,
@@ -1186,6 +1183,9 @@ class OledServiceTest(unittest.TestCase):
                 )
             ]
         )
+        menu.rotate_nav(2, timestamp=1.0)
+        menu.click_nav()
+        menu.rotate_nav(1, timestamp=2.0)
 
         _frame, _percent, _muted, changed, commands, pause_playback, resume_playback = handle_oled_input_events(
             events,
@@ -1203,7 +1203,7 @@ class OledServiceTest(unittest.TestCase):
         frame = menu.render()
         self.assertIsInstance(frame, ResumeChoiceFrame)
         self.assertEqual(frame.top, "The Hobbit")
-        self.assertEqual(frame.options, ("Home", "Continue", "Start over"))
+        self.assertEqual(frame.options, ("Back", "Continue", "Start over"))
         self.assertEqual(frame.selected_index, 1)
         self.assertEqual(spoken[0].text, "Continue")
         self.assertEqual(spoken[0].delay_seconds, 0)
@@ -1215,6 +1215,9 @@ class OledServiceTest(unittest.TestCase):
         menu = ApplianceMenu(
             [Book(id="book-1", title="The Hobbit", author="J.R.R. Tolkien", duration=1, cover_url="")]
         )
+        menu.rotate_nav(2, timestamp=1.0)
+        menu.click_nav()
+        menu.rotate_nav(1, timestamp=2.0)
 
         frame, _percent, _muted, changed, commands, pause_playback, resume_playback = handle_oled_input_events(
             events, menu
@@ -1228,13 +1231,15 @@ class OledServiceTest(unittest.TestCase):
         rendered = menu.render()
         self.assertIsInstance(rendered, ResumeChoiceFrame)
         self.assertEqual(rendered.top, "The Hobbit")
-        self.assertEqual(rendered.options, ("Home", "Start"))
+        self.assertEqual(rendered.options, ("Back", "Start"))
         self.assertEqual(rendered.selected_index, 1)
 
-    def test_nav_hold_opens_bluetooth_menu(self) -> None:
+    def test_nav_hold_returns_to_parent_library_view(self) -> None:
         events = queue.SimpleQueue()
         events.put(InputEvent("nav_hold"))
         menu = ApplianceMenu()
+        menu.library_index = next(index for index, entry in enumerate(menu.library_entries) if entry.target == "title")
+        menu.click_nav()
 
         frame, _percent, _muted, changed, commands, pause_playback, resume_playback = handle_oled_input_events(
             events,
@@ -1244,14 +1249,12 @@ class OledServiceTest(unittest.TestCase):
 
         self.assertIsNone(frame)
         self.assertTrue(changed)
-        self.assertEqual(len(commands), 1)
-        self.assertEqual(commands[0].type, CommandType.PAUSE_PLAYBACK)
+        self.assertEqual(commands, [])
         self.assertFalse(pause_playback)
         self.assertFalse(resume_playback)
         rendered = menu.render()
-        self.assertIsInstance(rendered, BluetoothMenuFrame)
-        self.assertFalse(rendered.enabled)
-        self.assertEqual(rendered.options, ("Back", "Enable", "Pair"))
+        self.assertIsInstance(rendered, HomeFrame)
+        self.assertEqual(menu.library_view, "root")
 
     def test_bluetooth_scan_command_starts_worker_and_returns_pairing_frame(self) -> None:
         menu = ApplianceMenu()
@@ -1356,20 +1359,22 @@ class OledServiceTest(unittest.TestCase):
         self.assertFalse(menu.bluetooth_enabled)
         self.assertEqual(overlay, BLUETOOTH_POWER_FRAME)
 
-    def test_volume_click_mute_requests_playback_pause(self) -> None:
+    def test_volume_click_emits_playback_toggle_without_changing_volume(self) -> None:
         events = queue.SimpleQueue()
         events.put(InputEvent("volume_click"))
         menu = ApplianceMenu()
+        menu.set_session(make_playback_session())
 
-        with patch("abs_kids_player.oled_service.toggle_mute", return_value=VolumeState(percent=50, muted=True)):
-            frame, _percent, muted, _changed, _commands, pause_playback, resume_playback = handle_oled_input_events(
-                events, menu
-            )
+        frame, percent, muted, changed, commands, pause_playback, resume_playback = handle_oled_input_events(
+            events, menu
+        )
 
-        self.assertIsInstance(frame, VolumeFrame)
-        self.assertEqual(frame.top, "Muted")
-        self.assertTrue(muted)
-        self.assertTrue(pause_playback)
+        self.assertIsNone(frame)
+        self.assertEqual(percent, 50)
+        self.assertFalse(muted)
+        self.assertTrue(changed)
+        self.assertEqual([command.type for command in commands], [CommandType.TOGGLE_PLAYBACK])
+        self.assertFalse(pause_playback)
         self.assertFalse(resume_playback)
 
     def test_spoken_navigation_announces_volume_at_ten_percent_intervals(self) -> None:
@@ -1417,25 +1422,25 @@ class OledServiceTest(unittest.TestCase):
         self.assertFalse(resume_playback)
         self.assertEqual(spoken, [])
 
-    def test_spoken_navigation_ignores_volume_knob_mute_click(self) -> None:
+    def test_volume_click_with_spoken_navigation_emits_playback_toggle(self) -> None:
         events = queue.SimpleQueue()
         events.put(InputEvent("volume_click"))
         menu = ApplianceMenu()
+        menu.set_session(make_playback_session())
         spoken = []
 
-        with patch("abs_kids_player.oled_service.toggle_mute") as toggle:
-            frame, percent, muted, _changed, _commands, pause_playback, resume_playback = handle_oled_input_events(
-                events,
-                menu,
-                fallback_percent=50,
-                fallback_muted=False,
-                spoken_navigation_feedback=spoken.append,
-            )
+        frame, percent, muted, _changed, commands, pause_playback, resume_playback = handle_oled_input_events(
+            events,
+            menu,
+            fallback_percent=50,
+            fallback_muted=False,
+            spoken_navigation_feedback=spoken.append,
+        )
 
-        toggle.assert_not_called()
-        self.assertIsInstance(frame, VolumeFrame)
+        self.assertIsNone(frame)
         self.assertEqual(percent, 50)
         self.assertFalse(muted)
+        self.assertEqual([command.type for command in commands], [CommandType.TOGGLE_PLAYBACK])
         self.assertFalse(pause_playback)
         self.assertFalse(resume_playback)
         self.assertEqual(spoken, [])
@@ -1519,45 +1524,45 @@ class OledServiceTest(unittest.TestCase):
         self.assertTrue(pause_playback)
         self.assertFalse(resume_playback)
 
-    def test_volume_click_from_zero_restores_volume_and_requests_resume(self) -> None:
+    def test_volume_click_from_zero_still_toggles_playback(self) -> None:
         events = queue.SimpleQueue()
         events.put(InputEvent("volume_click"))
         menu = ApplianceMenu()
+        menu.set_session(make_playback_session())
 
-        with patch("abs_kids_player.oled_service.toggle_mute", side_effect=AudioError("missing audio")):
-            frame, percent, muted, _changed, _commands, pause_playback, resume_playback = handle_oled_input_events(
-                events,
-                menu,
-                fallback_percent=0,
-                fallback_muted=False,
-            )
+        frame, percent, muted, _changed, commands, pause_playback, resume_playback = handle_oled_input_events(
+            events,
+            menu,
+            fallback_percent=0,
+            fallback_muted=False,
+        )
 
-        self.assertIsInstance(frame, VolumeFrame)
-        self.assertEqual(percent, DEFAULT_UNMUTE_VOLUME_PERCENT)
+        self.assertIsNone(frame)
+        self.assertEqual(percent, 0)
         self.assertFalse(muted)
-        self.assertFalse(frame.is_muted)
+        self.assertEqual([command.type for command in commands], [CommandType.TOGGLE_PLAYBACK])
         self.assertFalse(pause_playback)
-        self.assertTrue(resume_playback)
+        self.assertFalse(resume_playback)
 
-    def test_volume_click_unmute_requests_playback_resume(self) -> None:
+    def test_volume_click_while_muted_still_toggles_playback(self) -> None:
         events = queue.SimpleQueue()
         events.put(InputEvent("volume_click"))
         menu = ApplianceMenu()
+        menu.set_session(make_playback_session())
 
-        with patch("abs_kids_player.oled_service.toggle_mute", return_value=VolumeState(percent=50, muted=False)):
-            frame, percent, muted, _changed, _commands, pause_playback, resume_playback = handle_oled_input_events(
-                events,
-                menu,
-                fallback_percent=50,
-                fallback_muted=True,
-            )
+        frame, percent, muted, _changed, commands, pause_playback, resume_playback = handle_oled_input_events(
+            events,
+            menu,
+            fallback_percent=50,
+            fallback_muted=True,
+        )
 
-        self.assertIsInstance(frame, VolumeFrame)
+        self.assertIsNone(frame)
         self.assertEqual(percent, 50)
-        self.assertFalse(muted)
-        self.assertFalse(frame.is_muted)
+        self.assertTrue(muted)
+        self.assertEqual([command.type for command in commands], [CommandType.TOGGLE_PLAYBACK])
         self.assertFalse(pause_playback)
-        self.assertTrue(resume_playback)
+        self.assertFalse(resume_playback)
 
 
 if __name__ == "__main__":

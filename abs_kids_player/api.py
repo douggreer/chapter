@@ -220,6 +220,36 @@ class AudiobookshelfClient:
             f"/api/libraries/{library_id}/items",
             query={"sort": "media.metadata.title", "minified": 0},
         )
+        try:
+            user_progress = self.get_current_user().get("mediaProgress", [])
+        except AudiobookshelfError as error:
+            print(f"Audiobookshelf playback progress could not be loaded: {error}")
+            user_progress = []
+        progress_by_id: dict[str, dict[str, Any]] = {}
+        progress_entries = user_progress if isinstance(user_progress, list) else []
+        for progress_entry in progress_entries:
+            if not isinstance(progress_entry, dict):
+                continue
+            item_id = str(progress_entry.get("libraryItemId") or "")
+            if not item_id:
+                continue
+            previous = progress_by_id.get(item_id)
+            try:
+                last_update = float(
+                    progress_entry.get("lastUpdate")
+                    or progress_entry.get("progressLastUpdate")
+                    or 0
+                )
+                previous_last_update = float(
+                    (previous or {}).get("lastUpdate")
+                    or (previous or {}).get("progressLastUpdate")
+                    or 0
+                )
+            except (TypeError, ValueError):
+                last_update = previous_last_update = 0
+            if previous is None or last_update >= previous_last_update:
+                progress_by_id[item_id] = progress_entry
+
         books: list[Book] = []
         series_keys: list[str] = []
         fallback_counts: dict[str, int] = {}
@@ -229,8 +259,9 @@ class AudiobookshelfClient:
             metadata = media.get("metadata") or {}
             title = metadata.get("title") or item.get("relPath") or "Untitled"
             author = author_from_metadata(metadata)
+            author_names = author_names_from_metadata(metadata, author)
             cover_url = self.authenticated_media_url(f"/api/items/{item['id']}/cover")
-            progress = extract_progress(item)
+            progress = progress_by_id.get(str(item["id"])) or extract_progress(item)
             series_name, series_sequence = primary_series_from_metadata(metadata)
             series_key = series_name.casefold()
             book = Book(
@@ -243,11 +274,14 @@ class AudiobookshelfClient:
                 progress=float(progress.get("progress") or 0),
                 series_name=series_name,
                 series_sequence=series_sequence,
+                finished=bool(progress.get("isFinished", False)),
+                last_update=float(
+                    progress.get("lastUpdate")
+                    or progress.get("progressLastUpdate")
+                    or 0
+                ),
+                author_names=author_names,
             )
-            if not book.current_time:
-                remote_progress = self.get_progress(book.id) or {}
-                book.current_time = float(remote_progress.get("currentTime") or 0)
-                book.progress = float(remote_progress.get("progress") or 0)
             books.append(book)
             series_keys.append(series_key)
             if series_key:
@@ -422,20 +456,21 @@ def primary_series_from_metadata(metadata: dict[str, Any]) -> tuple[str, str]:
     if isinstance(raw_series, dict):
         raw_series = [raw_series]
 
-    entries: list[tuple[str, str]] = []
+    first_series = ("", "")
     if isinstance(raw_series, list):
         for value in raw_series:
             if not isinstance(value, dict):
                 continue
             name = str(value.get("name") or value.get("series") or "").strip()
             if name:
-                entries.append((name, normalized_series_sequence(value.get("sequence"))))
+                sequence = normalized_series_sequence(value.get("sequence"))
+                if not first_series[0]:
+                    first_series = (name, sequence)
+                if sequence:
+                    return name, sequence
 
-    for entry in entries:
-        if entry[1]:
-            return entry
-    if entries:
-        return entries[0]
+    if first_series[0]:
+        return first_series
 
     legacy = str(metadata.get("seriesName") or "").strip()
     match = re.match(r"^(.*?)\s+#\s*(\d+(?:\.\d+)?)\s*$", legacy)
@@ -516,6 +551,39 @@ def author_from_metadata(metadata: dict[str, Any]) -> str:
     if written_by:
         return written_by
     return clean_author(metadata.get("authorName") or metadata.get("author") or "")
+
+
+def author_names_from_metadata(metadata: dict[str, Any], fallback: str = "") -> tuple[str, ...]:
+    raw_authors = metadata.get("authors") or []
+    if isinstance(raw_authors, dict):
+        raw_authors = [raw_authors]
+
+    names: list[str] = []
+    seen: set[str] = set()
+    if isinstance(raw_authors, list):
+        for entry in raw_authors:
+            if isinstance(entry, dict):
+                role = str(entry.get("role") or entry.get("type") or "").strip().casefold()
+                if role and not (role.startswith("written by") or role in {"author", "authors"}):
+                    continue
+                name = clean_author(
+                    entry.get("name")
+                    or entry.get("authorName")
+                    or entry.get("author")
+                    or entry.get("value")
+                    or ""
+                )
+            else:
+                name = written_by_author(entry) or clean_author(entry)
+            key = name.casefold()
+            if name and key not in seen:
+                names.append(name)
+                seen.add(key)
+
+    if names:
+        return tuple(names)
+    clean_fallback = clean_author(fallback)
+    return (clean_fallback,) if clean_fallback else ()
 
 
 def written_by_author(value: Any) -> str:

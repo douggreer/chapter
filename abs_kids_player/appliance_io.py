@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import math
 import queue
+import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Protocol
 
@@ -65,7 +66,6 @@ class Sh1122Display:
         self.font_splash = load_font(ImageFont, 26)
         self.font_home_title = load_font(ImageFont, 18)
         self.font_home_author = load_font(ImageFont, 13)
-        self.font_section_letter = load_font(ImageFont, 20)
         self.font_top = load_font(ImageFont, 16)
         self.font_bottom = load_font(ImageFont, 12)
         self.font_screen_saver = load_screen_saver_fonts(ImageFont)
@@ -213,6 +213,7 @@ class Sh1122Display:
                 y=title_y,
                 fill=255,
                 offset=frame.title_scroll_px,
+                pause_distance=frame.scroll_pause_px,
             )
         else:
             title = fit_text(self.draw, frame.title, self.font_home_title, self.width)
@@ -221,14 +222,6 @@ class Sh1122Display:
         self.draw_centered_text(author, self.font_home_author, y=34, fill=180)
         if frame.series_position:
             self.draw_bottom_left_text(frame.series_position, self.font_bottom, fill=140, margin=3)
-        if frame.section_letter and frame.section_letter_fill > 0:
-            self.draw_bottom_right_text(
-                frame.section_letter,
-                self.font_section_letter,
-                fill=max(0, min(255, frame.section_letter_fill)),
-                margin=3,
-            )
-
     def draw_volume(self, frame: VolumeFrame) -> None:
         label = fit_text(self.draw, frame.top, self.font_top, self.width)
         self.draw_centered_text(label, self.font_top, y=9, fill=255)
@@ -264,6 +257,7 @@ class Sh1122Display:
                 y=title_y,
                 fill=255,
                 offset=frame.title_scroll_px,
+                pause_distance=frame.scroll_pause_px,
             )
         else:
             label = fit_text(self.draw, chapter, self.font_top, self.width)
@@ -360,13 +354,6 @@ class Sh1122Display:
         x = max(0, right - (text_right - left))
         self.draw.text((x, y), text, font=font, fill=fill)
 
-    def draw_bottom_right_text(self, text: str, font, fill: int, margin: int = 0) -> None:
-        text = oled_safe_text(text)
-        left, top, right, bottom = self.draw.textbbox((0, 0), text, font=font)
-        x = max(0, self.width - margin - (right - left) - left)
-        y = max(0, self.height - margin - (bottom - top) - top)
-        self.draw.text((x, y), text, font=font, fill=fill)
-
     def draw_bottom_left_text(self, text: str, font, fill: int, margin: int = 0) -> None:
         text = oled_safe_text(text)
         left, top, _right, bottom = self.draw.textbbox((0, 0), text, font=font)
@@ -406,13 +393,21 @@ class Sh1122Display:
         self.draw.line((x + 4, y + 2, x + 13, y + 9), fill=255, width=1)
         self.draw.line((x + 13, y + 9, x + 7, y + 14), fill=255, width=1)
 
-    def draw_scrolling_text(self, text: str, font, y: int, fill: int, offset: int) -> None:
+    def draw_scrolling_text(
+        self,
+        text: str,
+        font,
+        y: int,
+        fill: int,
+        offset: int,
+        pause_distance: int = 48,
+    ) -> None:
         text = oled_safe_text(text)
         width = text_width(self.draw, text, font)
         gap = 48
         scroll_distance = width + gap
-        pause_distance = 48
-        cycle_position = offset % (scroll_distance + pause_distance)
+        pause_distance = max(0, pause_distance)
+        cycle_position = offset % max(1, scroll_distance + pause_distance)
         scroll_offset = 0 if cycle_position < pause_distance else cycle_position - pause_distance
         x = -scroll_offset
         while x < self.width:
@@ -436,6 +431,7 @@ class Ky040Pins:
 class InputEvent:
     name: str
     steps: int = 0
+    timestamp: float = field(default_factory=time.monotonic, compare=False)
 
 
 class AmpShutdownPin:
@@ -478,20 +474,171 @@ class AmpShutdownPin:
             self.input = None
 
 
+class KnobButtonCoordinator:
+    _BUTTON_NAMES = ("nav", "volume")
+    _CLICK_EVENTS = {"nav": "nav_click", "volume": "volume_click"}
+    _HOLD_EVENTS = {"nav": "nav_hold", "volume": "volume_hold"}
+
+    def __init__(self, events: queue.SimpleQueue[InputEvent], hold_seconds: float = 1.0) -> None:
+        self.events = events
+        self._lock = threading.RLock()
+        self._hold_seconds = max(0.1, float(hold_seconds))
+        self._pressed = {name: False for name in self._BUTTON_NAMES}
+        self._pressed_at: dict[str, float] = {}
+        self._hold_fired = {name: False for name in self._BUTTON_NAMES}
+        self._single_timers: dict[str, threading.Timer] = {}
+        self._chord_timer: threading.Timer | None = None
+        self._chord_active = False
+        self._shutdown_fired = False
+        self._closed = False
+
+    def set_hold_seconds(self, seconds: float) -> None:
+        with self._lock:
+            self._hold_seconds = max(0.1, float(seconds))
+            now = time.monotonic()
+            if self._chord_active:
+                self._schedule_chord_locked(now)
+                return
+            for name in self._BUTTON_NAMES:
+                if self._pressed[name] and not self._hold_fired[name]:
+                    self._schedule_single_locked(name, now)
+
+    def press(self, name: str) -> None:
+        if name not in self._BUTTON_NAMES:
+            return
+        with self._lock:
+            if self._closed or self._pressed[name]:
+                return
+            now = time.monotonic()
+            self._pressed[name] = True
+            self._pressed_at[name] = now
+            if self._shutdown_fired:
+                return
+            if all(self._pressed.values()):
+                self._chord_active = True
+                for button_name in self._BUTTON_NAMES:
+                    self._cancel_single_locked(button_name)
+                self._schedule_chord_locked(now)
+                return
+            self._schedule_single_locked(name, now)
+
+    def release(self, name: str) -> None:
+        if name not in self._BUTTON_NAMES:
+            return
+        with self._lock:
+            if self._closed or not self._pressed[name]:
+                return
+            now = time.monotonic()
+            held_seconds = now - self._pressed_at.get(name, now)
+            self._pressed[name] = False
+            self._cancel_single_locked(name)
+
+            if self._shutdown_fired:
+                self._pressed_at.pop(name, None)
+                if not any(self._pressed.values()):
+                    self._reset_idle_locked()
+                return
+
+            if self._chord_active:
+                self._chord_active = False
+                self._cancel_chord_locked()
+                if not self._hold_fired[name]:
+                    event_name = (
+                        self._HOLD_EVENTS[name]
+                        if held_seconds >= self._hold_seconds
+                        else self._CLICK_EVENTS[name]
+                    )
+                    self.events.put(InputEvent(event_name))
+                self._hold_fired[name] = False
+                self._pressed_at.pop(name, None)
+                other_name = "volume" if name == "nav" else "nav"
+                if self._pressed[other_name] and not self._hold_fired[other_name]:
+                    self._schedule_single_locked(other_name, now)
+                if not any(self._pressed.values()):
+                    self._reset_idle_locked()
+                return
+
+            if not self._hold_fired[name]:
+                self.events.put(InputEvent(self._CLICK_EVENTS[name]))
+            self._hold_fired[name] = False
+            self._pressed_at.pop(name, None)
+
+    def close(self) -> None:
+        with self._lock:
+            self._closed = True
+            for name in self._BUTTON_NAMES:
+                self._cancel_single_locked(name)
+            self._cancel_chord_locked()
+
+    def _schedule_single_locked(self, name: str, now: float) -> None:
+        self._cancel_single_locked(name)
+        pressed_at = self._pressed_at.get(name, now)
+        delay = max(0.0, self._hold_seconds - (now - pressed_at))
+        timer = threading.Timer(delay, self._fire_single, args=(name,))
+        timer.daemon = True
+        self._single_timers[name] = timer
+        timer.start()
+
+    def _schedule_chord_locked(self, now: float) -> None:
+        self._cancel_chord_locked()
+        latest_press = max(self._pressed_at.get(name, now) for name in self._BUTTON_NAMES)
+        delay = max(0.0, self._hold_seconds - (now - latest_press))
+        self._chord_timer = threading.Timer(delay, self._fire_chord)
+        self._chord_timer.daemon = True
+        self._chord_timer.start()
+
+    def _fire_single(self, name: str) -> None:
+        with self._lock:
+            self._single_timers.pop(name, None)
+            if self._closed or self._chord_active or self._shutdown_fired or not self._pressed[name]:
+                return
+            self._hold_fired[name] = True
+            self.events.put(InputEvent(self._HOLD_EVENTS[name]))
+
+    def _fire_chord(self) -> None:
+        with self._lock:
+            self._chord_timer = None
+            if self._closed or not self._chord_active or not all(self._pressed.values()):
+                return
+            self._shutdown_fired = True
+            self._chord_active = False
+            for name in self._BUTTON_NAMES:
+                self._cancel_single_locked(name)
+            self.events.put(InputEvent("device_shutdown"))
+
+    def _cancel_single_locked(self, name: str) -> None:
+        timer = self._single_timers.pop(name, None)
+        if timer is not None:
+            timer.cancel()
+
+    def _cancel_chord_locked(self) -> None:
+        timer = self._chord_timer
+        self._chord_timer = None
+        if timer is not None:
+            timer.cancel()
+
+    def _reset_idle_locked(self) -> None:
+        for name in self._BUTTON_NAMES:
+            self._cancel_single_locked(name)
+            self._pressed_at.pop(name, None)
+            self._hold_fired[name] = False
+        self._cancel_chord_locked()
+        self._chord_active = False
+        self._shutdown_fired = False
+
+
 class RotaryEncoderInputs:
     def __init__(
         self,
         events: queue.SimpleQueue[InputEvent],
         nav: Ky040Pins = Ky040Pins(clk=5, dt=6, sw=13),
         volume: Ky040Pins = Ky040Pins(clk=12, dt=16, sw=26),
-        nav_hold_seconds: int = 3,
-        volume_hold_seconds: int = 10,
+        hold_seconds: float = 1.0,
     ) -> None:
         from gpiozero import Button
 
         self.events = events
-        self.nav_hold_fired = False
-        self.volume_hold_fired = False
+        self.button_coordinator = KnobButtonCoordinator(events, hold_seconds)
         self.nav_encoder = QuadratureInput(
             nav.clk,
             nav.dt,
@@ -504,45 +651,15 @@ class RotaryEncoderInputs:
             lambda step: events.put(InputEvent("volume", step)),
             reversed=volume.reversed,
         )
-        self.nav_button = Button(
-            nav.sw,
-            pull_up=True,
-            bounce_time=0.05,
-            hold_time=nav_hold_seconds,
-            hold_repeat=False,
-        )
-        self.volume_button = Button(
-            volume.sw,
-            pull_up=True,
-            bounce_time=0.05,
-            hold_time=volume_hold_seconds,
-            hold_repeat=False,
-        )
+        self.nav_button = Button(nav.sw, pull_up=True, bounce_time=0.05)
+        self.volume_button = Button(volume.sw, pull_up=True, bounce_time=0.05)
+        self.nav_button.when_pressed = lambda: self.button_coordinator.press("nav")
+        self.nav_button.when_released = lambda: self.button_coordinator.release("nav")
+        self.volume_button.when_pressed = lambda: self.button_coordinator.press("volume")
+        self.volume_button.when_released = lambda: self.button_coordinator.release("volume")
 
-        self.nav_button.when_held = self.on_nav_held
-        self.nav_button.when_released = self.on_nav_released
-        self.volume_button.when_held = self.on_volume_held
-        self.volume_button.when_released = self.on_volume_released
-
-    def on_nav_held(self) -> None:
-        self.nav_hold_fired = True
-        self.events.put(InputEvent("nav_hold"))
-
-    def on_nav_released(self) -> None:
-        if self.nav_hold_fired:
-            self.nav_hold_fired = False
-            return
-        self.events.put(InputEvent("nav_click"))
-
-    def on_volume_held(self) -> None:
-        self.volume_hold_fired = True
-        self.events.put(InputEvent("show_ip"))
-
-    def on_volume_released(self) -> None:
-        if self.volume_hold_fired:
-            self.volume_hold_fired = False
-            return
-        self.events.put(InputEvent("volume_click"))
+    def set_hold_seconds(self, seconds: float) -> None:
+        self.button_coordinator.set_hold_seconds(seconds)
 
 
 class NavigationRotaryInput:
@@ -550,37 +667,25 @@ class NavigationRotaryInput:
         self,
         events: queue.SimpleQueue[InputEvent],
         nav: Ky040Pins = Ky040Pins(clk=5, dt=6, sw=13),
-        nav_hold_seconds: int = 3,
+        hold_seconds: float = 1.0,
+        button_coordinator: KnobButtonCoordinator | None = None,
     ) -> None:
         from gpiozero import Button
 
         self.events = events
-        self.nav_hold_fired = False
+        self.button_coordinator = button_coordinator or KnobButtonCoordinator(events, hold_seconds)
         self.encoder = QuadratureInput(
             nav.clk,
             nav.dt,
             lambda step: events.put(InputEvent("nav", step)),
             reversed=nav.reversed,
         )
-        self.button = Button(
-            nav.sw,
-            pull_up=True,
-            bounce_time=0.05,
-            hold_time=nav_hold_seconds,
-            hold_repeat=False,
-        )
-        self.button.when_held = self.on_held
-        self.button.when_released = self.on_released
+        self.button = Button(nav.sw, pull_up=True, bounce_time=0.05)
+        self.button.when_pressed = lambda: self.button_coordinator.press("nav")
+        self.button.when_released = lambda: self.button_coordinator.release("nav")
 
-    def on_held(self) -> None:
-        self.nav_hold_fired = True
-        self.events.put(InputEvent("nav_hold"))
-
-    def on_released(self) -> None:
-        if self.nav_hold_fired:
-            self.nav_hold_fired = False
-            return
-        self.events.put(InputEvent("nav_click"))
+    def set_hold_seconds(self, seconds: float) -> None:
+        self.button_coordinator.set_hold_seconds(seconds)
 
 
 class VolumeRotaryInput:
@@ -588,38 +693,25 @@ class VolumeRotaryInput:
         self,
         events: queue.SimpleQueue[InputEvent],
         volume: Ky040Pins = Ky040Pins(clk=12, dt=16, sw=26),
-        volume_hold_seconds: int = 10,
+        hold_seconds: float = 1.0,
+        button_coordinator: KnobButtonCoordinator | None = None,
     ) -> None:
         from gpiozero import Button
 
         self.events = events
-        self.volume_hold_fired = False
+        self.button_coordinator = button_coordinator or KnobButtonCoordinator(events, hold_seconds)
         self.encoder = QuadratureInput(
             volume.clk,
             volume.dt,
             lambda step: events.put(InputEvent("volume", step)),
             reversed=volume.reversed,
         )
-        self.button = Button(
-            volume.sw,
-            pull_up=True,
-            bounce_time=0.05,
-            hold_time=volume_hold_seconds,
-            hold_repeat=False,
-        )
+        self.button = Button(volume.sw, pull_up=True, bounce_time=0.05)
+        self.button.when_pressed = lambda: self.button_coordinator.press("volume")
+        self.button.when_released = lambda: self.button_coordinator.release("volume")
 
-        self.button.when_held = self.on_held
-        self.button.when_released = self.on_released
-
-    def on_held(self) -> None:
-        self.volume_hold_fired = True
-        self.events.put(InputEvent("show_ip"))
-
-    def on_released(self) -> None:
-        if self.volume_hold_fired:
-            self.volume_hold_fired = False
-            return
-        self.events.put(InputEvent("volume_click"))
+    def set_hold_seconds(self, seconds: float) -> None:
+        self.button_coordinator.set_hold_seconds(seconds)
 
 
 class QuadratureInput:

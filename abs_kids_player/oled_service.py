@@ -12,9 +12,18 @@ from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
 from typing import Callable
+from urllib.request import Request, urlopen
 
 from .api import AudiobookshelfClient, AudiobookshelfError, client_from_config
-from .appliance_io import AmpShutdownPin, InputEvent, Ky040Pins, NavigationRotaryInput, Sh1122Display, VolumeRotaryInput
+from .appliance_io import (
+    AmpShutdownPin,
+    InputEvent,
+    KnobButtonCoordinator,
+    Ky040Pins,
+    NavigationRotaryInput,
+    Sh1122Display,
+    VolumeRotaryInput,
+)
 from .audio import (
     DEFAULT_MIXER_CONTROLS,
     AudioError,
@@ -22,7 +31,6 @@ from .audio import (
     change_volume,
     play_boot_chime,
     play_control_click,
-    toggle_mute,
 )
 from .bluetooth_audio import (
     BluetoothActionResult,
@@ -45,11 +53,17 @@ from .config import (
     AppConfig,
     load_config,
 )
+from .device_history import record_device_playback
 from .library_cache import load_cached_books, save_cached_books
 from .models import Book
 from .network import get_lan_ip
-from .player_control import WebPlayerStatus, consume_web_player_commands, save_web_player_status
-from .player_state import clear_last_playback, load_player_state, save_last_playback
+from .player_control import (
+    WebPlayerStatus,
+    consume_web_player_commands,
+    save_web_bluetooth_devices,
+    save_web_player_status,
+)
+from .player_state import LastPlaybackState, clear_last_playback, save_last_playback
 from .podcast import (
     PodcastError,
     PodcastProgressClient,
@@ -67,6 +81,7 @@ from .rotary_ui import (
     ScreenSaverFrame,
     SplashFrame,
     SpokenSelection,
+    Screen,
     TwoLineFrame,
     VolumeFrame,
     WifiSetupFrame,
@@ -84,8 +99,8 @@ DEFAULT_STATUS_REFRESH_SECONDS = 2.0
 DEFAULT_SPLASH_SECONDS = 0.5
 DEFAULT_STARTUP_NETWORK_GRACE_SECONDS = 30.0
 DEFAULT_HOME_REFRESH_SECONDS = 60.0
-DEFAULT_TITLE_SCROLL_DELAY_SECONDS = 2.0
-DEFAULT_TITLE_SCROLL_PX_PER_SECOND = 16.0
+DEFAULT_TITLE_SCROLL_DELAY_SECONDS = 0.15
+DEFAULT_TITLE_SCROLL_PX_PER_SECOND = 48.0
 DEFAULT_TITLE_SCROLL_LOOP_PAUSE_SECONDS = 2.0
 DEFAULT_VOLUME_OVERLAY_SECONDS = 3.0
 DEFAULT_IP_OVERLAY_SECONDS = 5.0
@@ -238,7 +253,7 @@ def bluetooth_pairing_frame(frame: TwoLineFrame, now: float) -> TwoLineFrame:
 class Shutdown:
     requested = False
 
-    def request(self, _signum: int, _frame: object) -> None:
+    def request(self, _signum: int | None = None, _frame: object | None = None) -> None:
         self.requested = True
 
 
@@ -342,6 +357,19 @@ def sorted_books_for_menu(
     return sorted(books, key=lambda book: book_menu_sort_key(book, sort_mode))
 
 
+def latest_user_in_progress_book_state(books: list[Book]) -> LastPlaybackState | None:
+    candidates = [book for book in books if book.is_in_progress and book.last_update > 0]
+    if not candidates:
+        return None
+    book = max(candidates, key=lambda candidate: candidate.last_update)
+    return LastPlaybackState(
+        book_id=book.id,
+        title=book.display_title,
+        current_time=book.current_time,
+        updated_at=book.last_update,
+    )
+
+
 def book_menu_sort_key(
     book: Book,
     sort_mode: str = LIBRARY_SORT_TITLE,
@@ -421,7 +449,6 @@ def home_frame_for_books(books: list[Book]) -> DisplayFrame:
     return HomeFrame(
         book.display_title,
         book.author,
-        series_position=book.series_position,
         is_podcast=book_is_podcast(book),
     )
 
@@ -433,26 +460,24 @@ def scrolled_home_frame(
     pixels_per_second: float = DEFAULT_TITLE_SCROLL_PX_PER_SECOND,
     loop_pause_seconds: float = DEFAULT_TITLE_SCROLL_LOOP_PAUSE_SECONDS,
 ) -> DisplayFrame:
-    if not isinstance(frame, HomeFrame) or elapsed_seconds < delay_seconds:
+    if not isinstance(frame, HomeFrame):
+        return frame
+    if elapsed_seconds < delay_seconds:
         return frame
     active_seconds = elapsed_seconds - delay_seconds
-    loop_pause_px = round(loop_pause_seconds * pixels_per_second)
-    raw_scroll_px = round(active_seconds * pixels_per_second)
-    if loop_pause_px and raw_scroll_px % loop_pause_px == 0:
-        scroll_px = raw_scroll_px
-    else:
-        scroll_px = raw_scroll_px
+    loop_pause_px = max(0, round(max(0.0, loop_pause_seconds) * pixels_per_second))
+    scroll_px = loop_pause_px + round(active_seconds * pixels_per_second)
     return HomeFrame(
         title=frame.title,
         author=frame.author,
         series_position=frame.series_position,
         title_scroll_px=scroll_px,
         title_scrolling=True,
-        section_letter=frame.section_letter,
-        section_letter_fill=frame.section_letter_fill,
         muted=frame.muted,
         bluetooth_connected=frame.bluetooth_connected,
         is_podcast=frame.is_podcast,
+        subtitle=frame.subtitle,
+        scroll_pause_px=loop_pause_px,
     )
 
 
@@ -474,6 +499,7 @@ def same_home_cache_subject(frame: DisplayFrame | None, next_frame: DisplayFrame
             and frame.author == next_frame.author
             and frame.series_position == next_frame.series_position
             and frame.is_podcast == next_frame.is_podcast
+            and frame.subtitle == next_frame.subtitle
         )
     return frame == next_frame
 
@@ -582,16 +608,23 @@ def consume_screen_saver_wake_input(
         return False, quiet_until
 
     consumed = False
+    shutdown_events: list[InputEvent] = []
     while True:
         try:
-            events.get_nowait()
-            consumed = True
+            event = events.get_nowait()
+            if event.name == "device_shutdown":
+                shutdown_events.append(event)
+            else:
+                consumed = True
         except queue.Empty:
             break
 
+    for event in shutdown_events:
+        events.put(event)
+
     if consumed:
         quiet_until = now + quiet_seconds
-    return screen_saver_visible and consumed, quiet_until
+    return screen_saver_visible and consumed and not shutdown_events, quiet_until
 
 
 def drain_input_events(events: queue.SimpleQueue[InputEvent]) -> None:
@@ -634,14 +667,6 @@ def software_volume_state_for_event(
             percent=min(max(fallback_percent + event.steps * VOLUME_STEP_PERCENT, 0), 100),
             muted=False,
         )
-
-    if event.name == "volume_click":
-        if effective_muted(fallback_percent, fallback_muted):
-            return VolumeState(
-                percent=fallback_percent if fallback_percent > 0 else DEFAULT_UNMUTE_VOLUME_PERCENT,
-                muted=False,
-            )
-        return VolumeState(percent=fallback_percent, muted=True)
 
     return VolumeState(percent=fallback_percent, muted=fallback_muted)
 
@@ -695,6 +720,41 @@ def save_playback_state(playback: GStreamerPlayback) -> bool:
     return True
 
 
+def request_clean_device_shutdown(
+    display: Sh1122Display,
+    playback: GStreamerPlayback,
+    menu: ApplianceMenu,
+    volume_percent: int,
+    muted: bool,
+) -> bool:
+    display.show(TwoLineFrame("Shutting down", "Please wait"))
+    try:
+        if playback.is_playing:
+            playback.pause(sync=True)
+    except Exception as error:
+        print(f"Playback pause before shutdown failed: {error}")
+    playback.is_playing = False
+    menu.update_playback(playback.current_time, False)
+    if playback.session is not None:
+        try:
+            save_playback_state(playback)
+            record_device_playback(playback.session, playback.current_time)
+        except Exception as error:
+            print(f"Playback state save before shutdown failed: {error}")
+    publish_web_player_status(playback, volume_percent, muted)
+
+    try:
+        request = Request("http://127.0.0.1:47831/internal/shutdown", data=b"", method="POST")
+        with urlopen(request, timeout=2.0) as response:
+            if response.status != 202:
+                raise OSError(f"unexpected shutdown response: HTTP {response.status}")
+    except Exception as error:
+        print(f"Clean device shutdown could not be started: {error}")
+        display.show(TwoLineFrame("Shutdown failed", "Try again"))
+        return False
+    return True
+
+
 def poll_playback_safely(playback: GStreamerPlayback) -> DisplayFrame | None:
     try:
         playback.poll()
@@ -714,6 +774,7 @@ def web_status_for_playback(
     return WebPlayerStatus(
         title=playback.session.title,
         author=playback.session.author,
+        book_id=playback.session.library_item_id,
         current_time=playback.current_time,
         duration=playback.session.duration,
         is_playing=playback.is_playing,
@@ -748,6 +809,8 @@ def handle_web_player_commands(
     menu: ApplianceMenu,
     volume_percent: int,
     muted: bool,
+    playback_results: queue.SimpleQueue[PlaybackCommandResult] | None = None,
+    bluetooth_results: queue.SimpleQueue[BluetoothActionResult] | None = None,
 ) -> tuple[int, bool, bool, bool]:
     changed = False
     refresh_library = False
@@ -763,6 +826,11 @@ def handle_web_player_commands(
             refresh_library = True
             continue
 
+        if command.action == "refresh_books":
+            refresh_library = True
+            changed = True
+            continue
+
         if command.action == "resort_library":
             selected_book_id = menu.books[menu.book_index].id if menu.books else ""
             sort_mode = load_config().library_sort_mode
@@ -776,21 +844,116 @@ def handle_web_player_commands(
             changed = True
             continue
 
-        if command.action == "pause":
-            if playback.is_playing:
-                playback.pause(sync=True)
-                menu.update_playback(playback.current_time, playback.is_playing)
-                changed = True
-            continue
-
-        if command.action == "play":
-            if playback.session is not None and not playback.is_playing:
+        if command.action in {"pause", "play", "toggle"}:
+            if playback.session is None:
+                continue
+            should_play = (
+                command.action == "play"
+                or (command.action == "toggle" and not playback.is_playing)
+            )
+            if command.action == "pause":
+                should_play = False
+            if should_play and not playback.is_playing:
                 if volume_percent <= 0:
                     volume_percent = DEFAULT_UNMUTE_VOLUME_PERCENT
                 muted = False
                 playback.resume(sync=False, percent=volume_percent, muted=muted)
+                changed = True
+            elif not should_play and playback.is_playing:
+                playback.pause(sync=True)
+                changed = True
+            menu.update_playback(playback.current_time, playback.is_playing)
+            menu.screen = Screen.PLAYING
+            menu.playing_action_index = 0
+            menu.home_return_elapsed = 0.0
+            changed = True
+            continue
+
+        if command.action in {"previous_chapter", "next_chapter"}:
+            if playback.session is None:
+                continue
+            chapters = menu.chapters
+            if chapters:
+                direction = -1 if command.action == "previous_chapter" else 1
+                target_index = min(max(menu.current_chapter_index + direction, 0), len(chapters) - 1)
+                if target_index != menu.current_chapter_index:
+                    playback.seek_global(chapters[target_index].start)
+                    if not playback.is_playing:
+                        playback.resume(sync=False, percent=volume_percent, muted=muted)
+                    changed = True
+            menu.update_playback(playback.current_time, playback.is_playing)
+            menu.screen = Screen.PLAYING
+            menu.playing_action_index = 0
+            menu.home_return_elapsed = 0.0
+            changed = True
+            continue
+
+        if command.action == "play_book":
+            if not menu.prepare_remote_book(command.book_id):
+                continue
+            menu.remote_playback_loading = False
+            if (
+                playback.session is not None
+                and playback.session.library_item_id == command.book_id
+                and not command.start_over
+            ):
+                if not playback.is_playing:
+                    if volume_percent <= 0:
+                        volume_percent = DEFAULT_UNMUTE_VOLUME_PERCENT
+                    muted = False
+                    playback.resume(sync=False, percent=volume_percent, muted=muted)
+                menu.set_session(playback.session, is_playing=playback.is_playing)
                 menu.update_playback(playback.current_time, playback.is_playing)
                 changed = True
+                continue
+            menu.remote_playback_loading = True
+            web_command = MenuCommand(
+                CommandType.PLAY_BOOK,
+                book_id=command.book_id,
+                start_over=command.start_over,
+                resume_time=command.resume_time or 0.0,
+            )
+            if playback_results is not None:
+                start_play_book_worker(web_command, playback, playback_results)
+            else:
+                result = play_book_command_result(web_command, playback)
+                if result.session is not None:
+                    menu.set_session(result.session, is_playing=playback.is_playing)
+                    menu.remote_playback_loading = False
+                else:
+                    menu.remote_playback_loading = False
+            changed = True
+            continue
+
+        if command.action in {"bluetooth_enable", "bluetooth_disable"}:
+            enabled = command.action == "bluetooth_enable"
+            menu.set_bluetooth_enabled(enabled)
+            menu.remote_bluetooth_command = True
+            if bluetooth_results is not None:
+                start_bluetooth_power_worker(enabled, bluetooth_results)
+            changed = True
+            continue
+
+        if command.action == "bluetooth_scan":
+            menu.remote_bluetooth_command = True
+            if bluetooth_results is not None:
+                start_bluetooth_scan_worker(bluetooth_results)
+            changed = True
+            continue
+
+        if command.action == "bluetooth_pair":
+            device = BluetoothDevice(command.device_address, command.device_name)
+            menu.remote_bluetooth_command = True
+            if bluetooth_results is not None:
+                start_bluetooth_pairing_worker(device, bluetooth_results)
+            changed = True
+            continue
+
+        if command.action == "bluetooth_unpair":
+            menu.remote_bluetooth_command = True
+            if bluetooth_results is not None:
+                start_bluetooth_unpair_worker(bluetooth_results)
+            changed = True
             continue
 
         if command.action == "volume" and command.value is not None:
@@ -832,17 +995,36 @@ def run_oled_service(
     playback = GStreamerPlayback()
     spoken_navigation = SpokenNavigationFeedback(playback.set_spoken_navigation_ducked)
     amp_shutdown: AmpShutdownPin | None = None
+    button_coordinator: KnobButtonCoordinator | None = None
     service_started_at = time.monotonic()
 
     try:
         display.show(splash_frame())
         sleep_until_shutdown(shutdown, splash_seconds)
 
+        startup_config = load_config()
+        screen_saver_idle_override = (
+            screen_saver_idle_seconds
+            if screen_saver_idle_seconds != DEFAULT_SCREEN_SAVER_IDLE_SECONDS
+            else None
+        )
+        if screen_saver_idle_override is not None:
+            startup_config = replace(
+                startup_config,
+                screen_saver_idle_seconds=max(0.0, screen_saver_idle_override),
+            )
+        runtime_config = startup_config
         events: queue.SimpleQueue[InputEvent] = queue.SimpleQueue()
+        button_coordinator = KnobButtonCoordinator(events, startup_config.knob_hold_seconds)
         nav_input: NavigationRotaryInput | None = None
         if nav_input_enabled:
             try:
-                nav_input = NavigationRotaryInput(events, nav=nav_pins)
+                nav_input = NavigationRotaryInput(
+                    events,
+                    nav=nav_pins,
+                    hold_seconds=startup_config.knob_hold_seconds,
+                    button_coordinator=button_coordinator,
+                )
                 print(
                     "Navigation rotary enabled on "
                     f"CLK GPIO{nav_pins.clk}, DT GPIO{nav_pins.dt}, SW GPIO{nav_pins.sw}, "
@@ -854,7 +1036,12 @@ def run_oled_service(
         volume_input: VolumeRotaryInput | None = None
         if volume_input_enabled:
             try:
-                volume_input = VolumeRotaryInput(events, volume=volume_pins)
+                volume_input = VolumeRotaryInput(
+                    events,
+                    volume=volume_pins,
+                    hold_seconds=startup_config.knob_hold_seconds,
+                    button_coordinator=button_coordinator,
+                )
                 print(
                     "Volume rotary enabled on "
                     f"CLK GPIO{volume_pins.clk}, DT GPIO{volume_pins.dt}, SW GPIO{volume_pins.sw}"
@@ -876,16 +1063,21 @@ def run_oled_service(
                 amp_shutdown = None
                 print(f"MAX98357 amp shutdown could not start: {error}")
 
-        startup_config = load_config()
-        runtime_config = startup_config
         playback.set_playback_rate(startup_config.playback_speed)
         menu = ApplianceMenu(
             sorted_books_for_menu(load_cached_books(startup_config), startup_config.library_sort_mode),
             library_sort_mode=startup_config.library_sort_mode,
+            root_menu_order=startup_config.root_menu_order,
+            root_menu_enabled=startup_config.root_menu_enabled,
+            navigation_acceleration_mode=startup_config.navigation_acceleration_mode,
+            navigation_accel_threshold_milliseconds=startup_config.navigation_accel_threshold_milliseconds,
+            browse_return_seconds=startup_config.browse_return_seconds,
         )
         menu.set_bluetooth_enabled(False)
         menu.set_bluetooth_connected(False)
-        menu.set_startup_resume(load_player_state())
+        startup_resume_pending = startup_config.startup_resume_last_played
+        if startup_resume_pending:
+            menu.set_startup_resume(latest_user_in_progress_book_state(menu.books))
         books_error_frame: DisplayFrame | None = None
         cached_home_frame: DisplayFrame | None = None
         cached_status: WifiStatus | None = None
@@ -960,11 +1152,28 @@ def run_oled_service(
                 software_update_screen_visible = False
                 if now - last_runtime_config_load >= DEFAULT_RUNTIME_CONFIG_REFRESH_SECONDS:
                     refreshed_config = load_config()
+                    if screen_saver_idle_override is not None:
+                        refreshed_config = replace(
+                            refreshed_config,
+                            screen_saver_idle_seconds=max(0.0, screen_saver_idle_override),
+                        )
                     if refreshed_config.playback_speed != runtime_config.playback_speed:
                         try:
                             playback.set_playback_rate(refreshed_config.playback_speed)
                         except PlaybackError as error:
                             print(f"Playback speed update failed: {error}")
+                    if refreshed_config.knob_hold_seconds != runtime_config.knob_hold_seconds:
+                        try:
+                            button_coordinator.set_hold_seconds(refreshed_config.knob_hold_seconds)
+                        except Exception as error:
+                            print(f"Knob hold setting update failed: {error}")
+                    menu.set_navigation_settings(
+                        refreshed_config.root_menu_order,
+                        refreshed_config.root_menu_enabled,
+                        refreshed_config.navigation_acceleration_mode,
+                        refreshed_config.navigation_accel_threshold_milliseconds,
+                        refreshed_config.browse_return_seconds,
+                    )
                     runtime_config = refreshed_config
                     last_runtime_config_load = now
                 woke_screen_saver, wake_input_quiet_until = consume_screen_saver_wake_input(
@@ -1029,6 +1238,10 @@ def run_oled_service(
                             else None
                         ),
                     )
+                if startup_resume_pending and (
+                    overlay is not None or menu_changed or commands or pause_playback or resume_playback
+                ):
+                    startup_resume_pending = False
                 commands, software_volume, software_muted, unmuted_for_play, resume_from_muted_play = (
                     unmute_for_audible_playback_commands(
                         commands,
@@ -1047,6 +1260,7 @@ def run_oled_service(
                     except queue.Empty:
                         break
                     playback_loading = False
+                    menu.remote_playback_loading = False
                     menu_changed = True
                     cached_home_frame = None
                     home_frame_loaded_at = now
@@ -1054,6 +1268,7 @@ def run_oled_service(
                         overlay = playback_result.error_frame
                     elif playback_result.session is not None:
                         menu.set_session(playback_result.session, is_playing=playback.is_playing)
+                        record_device_playback(playback_result.session, playback.current_time)
                         if save_playback_state(playback):
                             last_playback_state_save = now
                 while True:
@@ -1068,6 +1283,9 @@ def run_oled_service(
                     home_frame_loaded_at = now
                     if book_result.books is not None:
                         menu.set_books(book_result.books)
+                        if startup_resume_pending:
+                            menu.set_startup_resume(latest_user_in_progress_book_state(book_result.books))
+                            startup_resume_pending = False
                         books_error_frame = (
                             None
                             if book_result.books
@@ -1102,13 +1320,18 @@ def run_oled_service(
                     menu.set_bluetooth_connected(bluetooth_connected)
                     playback.set_bluetooth_output_enabled(bluetooth_connected)
                     menu_changed = True
+                    remote_bluetooth_command = menu.remote_bluetooth_command
                     bluetooth_pairing_in_progress = False
                     if bluetooth_result.devices:
-                        menu.set_bluetooth_devices(
-                            [(device.address, device.name) for device in bluetooth_result.devices]
-                        )
+                        save_web_bluetooth_devices(list(bluetooth_result.devices))
+                        if not remote_bluetooth_command:
+                            menu.set_bluetooth_devices(
+                                [(device.address, device.name) for device in bluetooth_result.devices]
+                            )
                         overlay = None
                     else:
+                        if remote_bluetooth_command:
+                            save_web_bluetooth_devices([])
                         if (
                             bluetooth_result.success
                             and bluetooth_result.device_name
@@ -1116,8 +1339,10 @@ def run_oled_service(
                         ):
                             bluetooth_connected = True
                             menu.set_bluetooth_connected(True)
-                            menu.close_bluetooth_menu()
-                        overlay = bluetooth_result_frame(bluetooth_result)
+                            if not remote_bluetooth_command:
+                                menu.close_bluetooth_menu()
+                        overlay = None if remote_bluetooth_command else bluetooth_result_frame(bluetooth_result)
+                    menu.remote_bluetooth_command = False
                     if bluetooth_result.success:
                         run_playback_action(playback.refresh_audio_output, "Bluetooth audio output refresh")
                 playback_volume_state = (software_volume, software_muted)
@@ -1154,7 +1379,6 @@ def run_oled_service(
                         DEFAULT_ACTIVE_BRIGHTNESS_PERCENT,
                         display_brightness_percent,
                     )
-                menu.tick_section_letter(loop_elapsed)
                 if pause_playback and not resume_playback:
                     paused_for_mute = paused_for_mute or playback.is_playing
                     playback.is_playing = False
@@ -1187,6 +1411,18 @@ def run_oled_service(
                     cached_home_frame = None
                     home_frame_loaded_at = now
                 for command in commands:
+                    if command.type == CommandType.SHUTDOWN_DEVICE:
+                        if request_clean_device_shutdown(
+                            display,
+                            playback,
+                            menu,
+                            software_volume,
+                            software_muted,
+                        ):
+                            shutdown.request()
+                            break
+                        overlay = TwoLineFrame("Shutdown failed", "Try again")
+                        continue
                     if command.type == CommandType.CONFIRM_STILL_LISTENING:
                         sleep_timer.confirm()
                     command_overlay = handle_menu_command(command, menu, playback, playback_results, bluetooth_results)
@@ -1207,13 +1443,21 @@ def run_oled_service(
                         overlay = command_overlay
                     if command_overlay == BOOK_LOADING_FRAME:
                         playback_loading = True
+                if shutdown.requested:
+                    break
                 web_volume, web_muted, web_changed, web_refresh_library = handle_web_player_commands(
                     playback,
                     menu,
                     software_volume,
                     software_muted,
+                    playback_results,
+                    bluetooth_results,
                 )
+                if menu.remote_playback_loading:
+                    playback_loading = True
+                    overlay = BOOK_LOADING_FRAME
                 if web_changed:
+                    startup_resume_pending = False
                     software_volume = web_volume
                     software_muted = web_muted
                     last_playback_volume_state = (software_volume, software_muted)
@@ -1362,12 +1606,15 @@ def run_oled_service(
                             continue
                         menu.update_playback(playback.current_time, playback.is_playing)
                         if now - last_playback_state_save >= DEFAULT_PLAYBACK_STATE_SAVE_SECONDS:
-                            if save_playback_state(playback):
-                                last_playback_state_save = now
+                            save_playback_state(playback)
+                            if playback.is_playing:
+                                record_device_playback(playback.session, playback.current_time)
+                            last_playback_state_save = now
                         menu.update_title_scroll(
                             loop_elapsed,
-                            delay_seconds=DEFAULT_TITLE_SCROLL_DELAY_SECONDS,
-                            pixels_per_second=DEFAULT_TITLE_SCROLL_PX_PER_SECOND,
+                            delay_seconds=runtime_config.marquee_delay_seconds,
+                            pixels_per_second=runtime_config.marquee_speed_px_per_second,
+                            loop_pause_seconds=runtime_config.marquee_loop_pause_seconds,
                         )
                         if menu.tick_chapter_confirm_timeout(loop_elapsed):
                             cached_home_frame = None
@@ -1401,7 +1648,13 @@ def run_oled_service(
                         home_frame_loaded_at,
                         now,
                     )
-                    home_frame = scrolled_home_frame(cached_home_frame, now - home_frame_loaded_at)
+                    home_frame = scrolled_home_frame(
+                        cached_home_frame,
+                        now - home_frame_loaded_at,
+                        delay_seconds=runtime_config.marquee_delay_seconds,
+                        pixels_per_second=runtime_config.marquee_speed_px_per_second,
+                        loop_pause_seconds=runtime_config.marquee_loop_pause_seconds,
+                    )
                     frame = frame_for_boot_state(status, home_frame, startup_waiting=startup_waiting)
                 else:
                     books_error_frame = None
@@ -1414,8 +1667,8 @@ def run_oled_service(
                 normal_screen_saver_active = screen_saver_is_active(
                     now,
                     last_input_at,
-                    screen_saver_idle_seconds,
-                ) and not sleep_timer.prompt_active
+                    runtime_config.screen_saver_idle_seconds,
+                ) and runtime_config.screen_saver_idle_seconds > 0 and not sleep_timer.prompt_active
                 screen_saver_active = sleep_timer.sleeping or normal_screen_saver_active
                 if screen_saver_active:
                     screen_saver_mode = runtime_config.screen_saver_mode
@@ -1459,6 +1712,8 @@ def run_oled_service(
                 sleep_until_shutdown(shutdown, 5.0)
     finally:
         spoken_navigation.close()
+        if button_coordinator is not None:
+            button_coordinator.close()
         if amp_shutdown is not None:
             amp_shutdown.close()
         playback.stop()
@@ -1497,11 +1752,16 @@ def handle_oled_input_events(
         except queue.Empty:
             return frame, fallback_percent, fallback_muted, menu_changed, commands, pause_playback, resume_playback
 
+        if event.name == "device_shutdown":
+            commands.append(MenuCommand(CommandType.SHUTDOWN_DEVICE))
+            menu_changed = True
+            continue
+
         if event.name == "nav":
             if event.steps and control_click_feedback is not None:
                 control_click_feedback()
             previous_selection = menu.spoken_selection()
-            menu.rotate_nav(event.steps)
+            menu.rotate_nav(event.steps, timestamp=event.timestamp)
             speak_changed_selection(menu, previous_selection, spoken_navigation_feedback)
             menu_changed = True
             continue
@@ -1523,31 +1783,31 @@ def handle_oled_input_events(
             if spoken_navigation_cancel is not None:
                 spoken_navigation_cancel()
             previous_selection = menu.spoken_selection()
-            commands.extend(
-                menu.hold_nav(
-                    bluetooth_enabled=bluetooth_enabled,
-                    bluetooth_connected=bluetooth_connected,
-                )
-            )
+            commands.extend(menu.hold_nav())
             speak_changed_selection(menu, previous_selection, spoken_navigation_feedback)
+            menu_changed = True
+            continue
+
+        if event.name == "volume_click":
+            if control_click_feedback is not None:
+                control_click_feedback()
+            if spoken_navigation_cancel is not None:
+                spoken_navigation_cancel()
+            commands.extend(menu.click_volume())
+            menu_changed = True
+            continue
+
+        if event.name == "volume_hold":
+            if spoken_navigation_cancel is not None:
+                spoken_navigation_cancel()
+            commands.extend(menu.hold_volume())
             menu_changed = True
             continue
 
         was_effectively_muted = effective_muted(fallback_percent, fallback_muted)
         previous_percent = fallback_percent
-        if software_volume_only and event.name in {"volume", "volume_click"}:
-            mute_blocked = (
-                event.name == "volume_click"
-                and spoken_navigation_enabled
-                and not was_effectively_muted
-            )
-            if mute_blocked:
-                state = VolumeState(
-                    percent=max(fallback_percent, SPOKEN_NAVIGATION_MIN_VOLUME_PERCENT),
-                    muted=False,
-                )
-            else:
-                state = software_volume_state_for_event(event, fallback_percent, fallback_muted)
+        if software_volume_only and event.name == "volume":
+            state = software_volume_state_for_event(event, fallback_percent, fallback_muted)
             if spoken_navigation_enabled and state.percent < SPOKEN_NAVIGATION_MIN_VOLUME_PERCENT:
                 state = VolumeState(percent=SPOKEN_NAVIGATION_MIN_VOLUME_PERCENT, muted=False)
             fallback_percent = state.percent
@@ -1555,17 +1815,15 @@ def handle_oled_input_events(
             frame = volume_frame_for_state(state)
             pause_playback = pause_playback or (not was_effectively_muted and frame.is_muted)
             resume_playback = resume_playback or (was_effectively_muted and not frame.is_muted)
-            if not mute_blocked:
-                speak_volume_state(
-                    frame,
-                    event.name,
-                    was_effectively_muted,
-                    previous_percent,
-                    spoken_navigation_feedback,
-                )
+            speak_volume_state(
+                frame,
+                event.name,
+                was_effectively_muted,
+                previous_percent,
+                spoken_navigation_feedback,
+            )
             continue
 
-        mute_blocked = False
         try:
             if event.name == "volume":
                 if (
@@ -1587,25 +1845,6 @@ def handle_oled_input_events(
                 frame = volume_frame_for_state(state)
                 pause_playback = pause_playback or (not was_effectively_muted and frame.is_muted)
                 resume_playback = resume_playback or (was_effectively_muted and not frame.is_muted)
-            elif event.name == "volume_click":
-                if spoken_navigation_enabled and not was_effectively_muted:
-                    state = VolumeState(
-                        percent=max(fallback_percent, SPOKEN_NAVIGATION_MIN_VOLUME_PERCENT),
-                        muted=False,
-                    )
-                    mute_blocked = True
-                else:
-                    state = toggle_mute(controls=mixer_controls)
-                    if was_effectively_muted and effective_muted(state.percent, state.muted):
-                        state = restored_audible_volume_state(mixer_controls)
-                fallback_percent = state.percent
-                fallback_muted = state.muted
-                frame = volume_frame_for_state(state)
-                pause_playback = pause_playback or (not was_effectively_muted and frame.is_muted)
-                resume_playback = resume_playback or (was_effectively_muted and not frame.is_muted)
-            elif event.name == "show_ip":
-                frame = setup_address_frame()
-
         except AudioError as error:
             print(f"Volume control failed: {error}")
             if event.name == "volume":
@@ -1616,25 +1855,9 @@ def handle_oled_input_events(
                 frame = VolumeFrame(fallback_percent, muted=fallback_percent <= 0)
                 pause_playback = pause_playback or (not was_effectively_muted and frame.is_muted)
                 resume_playback = resume_playback or (was_effectively_muted and not frame.is_muted)
-            elif event.name == "volume_click":
-                if spoken_navigation_enabled and not was_effectively_muted:
-                    fallback_muted = False
-                    fallback_percent = max(fallback_percent, SPOKEN_NAVIGATION_MIN_VOLUME_PERCENT)
-                    mute_blocked = True
-                elif was_effectively_muted and fallback_percent <= 0:
-                    fallback_percent = DEFAULT_UNMUTE_VOLUME_PERCENT
-                    fallback_muted = False
-                else:
-                    fallback_muted = not fallback_muted
-                frame = VolumeFrame(fallback_percent, muted=fallback_muted or fallback_percent <= 0)
-                pause_playback = pause_playback or (not was_effectively_muted and frame.is_muted)
-                resume_playback = resume_playback or (was_effectively_muted and not frame.is_muted)
-            elif event.name == "show_ip":
-                frame = setup_address_frame()
 
         if (
-            not mute_blocked
-            and event.name in {"volume", "volume_click"}
+            event.name == "volume"
             and isinstance(frame, VolumeFrame)
         ):
             speak_volume_state(
@@ -1661,13 +1884,7 @@ def speak_volume_state(
     if was_effectively_muted:
         feedback(SpokenSelection(f"Volume {frame.percent} percent"))
         return
-    if (
-        event_name == "volume_click"
-        or (
-            frame.percent != previous_percent
-            and frame.percent % SPOKEN_VOLUME_INTERVAL_PERCENT == 0
-        )
-    ):
+    if frame.percent != previous_percent and frame.percent % SPOKEN_VOLUME_INTERVAL_PERCENT == 0:
         feedback(SpokenSelection(f"Volume {frame.percent} percent"))
 
 
@@ -1917,31 +2134,12 @@ def handle_input_events_with_fallback(
                 fallback_percent = state.percent
                 fallback_muted = state.muted
                 frame = volume_frame_for_state(state)
-            elif event.name == "volume_click":
-                was_effectively_muted = effective_muted(fallback_percent, fallback_muted)
-                state = toggle_mute(controls=mixer_controls)
-                if was_effectively_muted and effective_muted(state.percent, state.muted):
-                    state = restored_audible_volume_state(mixer_controls)
-                fallback_percent = state.percent
-                fallback_muted = state.muted
-                frame = volume_frame_for_state(state)
-            elif event.name == "show_ip":
-                frame = setup_address_frame()
         except AudioError as error:
             print(f"Volume control failed: {error}")
             if event.name == "volume":
                 fallback_percent = min(max(fallback_percent + event.steps * 5, 0), 100)
                 fallback_muted = False
                 frame = VolumeFrame(fallback_percent, muted=fallback_percent <= 0)
-            elif event.name == "volume_click":
-                if effective_muted(fallback_percent, fallback_muted) and fallback_percent <= 0:
-                    fallback_percent = DEFAULT_UNMUTE_VOLUME_PERCENT
-                    fallback_muted = False
-                else:
-                    fallback_muted = not fallback_muted
-                frame = VolumeFrame(fallback_percent, muted=fallback_muted or fallback_percent <= 0)
-            elif event.name == "show_ip":
-                frame = setup_address_frame()
 
 
 def sleep_until_shutdown(shutdown: Shutdown, seconds: float) -> None:

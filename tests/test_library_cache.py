@@ -34,6 +34,9 @@ class LibraryCacheTest(unittest.TestCase):
                 series_name="Middle-earth",
                 series_sequence="1",
                 series_total=3,
+                finished=False,
+                last_update=1234,
+                author_names=("J.R.R. Tolkien", "Christopher Tolkien"),
             )
         ]
 
@@ -45,10 +48,12 @@ class LibraryCacheTest(unittest.TestCase):
                 raw_cache = path.read_text(encoding="utf-8")
 
         self.assertEqual(cached[0].title, "The Hobbit")
-        self.assertEqual(cached[0].display_title, "Middle-earth: The Hobbit")
+        self.assertEqual(cached[0].display_title, "The Hobbit")
         self.assertEqual(cached[0].current_time, 120)
         self.assertEqual(cached[0].cover_url, "")
         self.assertEqual(cached[0].series_position, "1/3")
+        self.assertEqual(cached[0].last_update, 1234)
+        self.assertEqual(cached[0].author_names, ("J.R.R. Tolkien", "Christopher Tolkien"))
         self.assertNotIn("secret-token", raw_cache)
 
     def test_does_not_load_cache_for_a_different_user(self) -> None:

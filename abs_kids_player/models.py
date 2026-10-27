@@ -15,21 +15,32 @@ class Book:
     series_name: str = ""
     series_sequence: str = ""
     series_total: int = 0
+    finished: bool = False
+    last_update: float = 0
+    author_names: tuple[str, ...] = ()
 
     @property
     def has_play_history(self) -> bool:
-        return self.current_time >= 5 and self.progress < 0.995
+        return self.current_time > 0 and not self.is_finished
+
+    @property
+    def is_finished(self) -> bool:
+        return self.finished or self.progress >= 0.995
+
+    @property
+    def is_in_progress(self) -> bool:
+        return self.current_time > 0 and not self.is_finished
+
+    @property
+    def authors(self) -> tuple[str, ...]:
+        if self.author_names:
+            return self.author_names
+        author = self.author.strip()
+        return (author,) if author else ()
 
     @property
     def display_title(self) -> str:
-        title = self.title.strip()
-        series = self.series_name.strip()
-        if not series:
-            return title
-        prefix = f"{series}:"
-        if title.casefold().startswith(prefix.casefold()):
-            return title
-        return f"{series}: {title}"
+        return self.title.strip()
 
     @property
     def series_position(self) -> str:

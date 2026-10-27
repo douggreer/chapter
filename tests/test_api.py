@@ -159,6 +159,18 @@ class ApiMetadataTest(unittest.TestCase):
 
         self.assertEqual(series, ("The Wild Robot", "2"))
 
+    def test_primary_series_ignores_additional_series(self) -> None:
+        series = primary_series_from_metadata(
+            {
+                "series": [
+                    {"id": "series-1", "name": "The Wild Robot", "sequence": "2"},
+                    {"id": "series-2", "name": "Peter Brown Collection", "sequence": "1"},
+                ]
+            }
+        )
+
+        self.assertEqual(series, ("The Wild Robot", "2"))
+
     def test_primary_series_reads_legacy_series_name(self) -> None:
         series = primary_series_from_metadata(
             {"seriesName": "Harry Potter (Full-Cast Editions) #5"}
@@ -189,13 +201,50 @@ class ApiMetadataTest(unittest.TestCase):
             side_effect=[
                 {"results": [{"name": "The Wild Robot", "numBooks": 3}]},
                 {"results": [item]},
+                {"mediaProgress": []},
             ],
         ):
             books = client.get_books("library-1")
 
         self.assertEqual(books[0].series_name, "The Wild Robot")
-        self.assertEqual(books[0].display_title, "The Wild Robot: The Wild Robot Escapes")
+        self.assertEqual(books[0].display_title, "The Wild Robot Escapes")
         self.assertEqual(books[0].series_position, "2/3")
+
+    def test_get_books_uses_bulk_progress_and_marks_finished_items(self) -> None:
+        client = AudiobookshelfClient("https://books.example.com", "token")
+        items = {
+            "results": [
+                {"id": "book-1", "media": {"duration": 200, "metadata": {"title": "In Progress"}}},
+                {"id": "book-2", "media": {"duration": 200, "metadata": {"title": "Finished"}}},
+            ]
+        }
+        current_user = {
+            "mediaProgress": [
+                {
+                    "libraryItemId": "book-1",
+                    "currentTime": 50,
+                    "progress": 0.25,
+                    "isFinished": False,
+                    "lastUpdate": 1000,
+                },
+                {
+                    "libraryItemId": "book-2",
+                    "currentTime": 200,
+                    "progress": 1,
+                    "isFinished": True,
+                    "lastUpdate": 2000,
+                },
+            ]
+        }
+        with patch.object(client, "request", side_effect=[{"results": []}, items, current_user]) as request:
+            books = client.get_books("library-1")
+
+        self.assertEqual(request.call_args_list[-1].args[:2], ("GET", "/api/me"))
+        self.assertEqual(
+            [(book.current_time, book.progress, book.last_update) for book in books],
+            [(50, 0.25, 1000), (200, 1, 2000)],
+        )
+        self.assertEqual([book.is_in_progress for book in books], [True, False])
 
     def test_get_books_uses_highest_legacy_sequence_when_series_endpoint_is_empty(self) -> None:
         client = AudiobookshelfClient("https://books.example.com", "token")
@@ -219,6 +268,7 @@ class ApiMetadataTest(unittest.TestCase):
             side_effect=[
                 {"results": []},
                 {"results": [item("book-2", 2), item("book-7", 7)]},
+                {"mediaProgress": []},
             ],
         ):
             books = client.get_books("library-1")

@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import hmac
 import html
+import ipaddress
 import json
 import secrets
 import subprocess
@@ -16,13 +17,16 @@ from urllib.parse import parse_qs, urlparse
 
 from . import __version__
 from .api import AudiobookshelfClient, AudiobookshelfError, client_from_config
-from .bluetooth_audio import connected_bluetooth_audio_device
+from .bluetooth_audio import MAC_ADDRESS_PATTERN, connected_bluetooth_audio_device
 from .config import (
     LIBRARY_SORT_AUTHOR,
     LIBRARY_SORT_TITLE,
     MAX_SLEEP_TIMER_MINUTES,
     MIN_SLEEP_TIMER_MINUTES,
+    NAV_ACCELERATION_MODES,
     PLAYBACK_SPEEDS,
+    ROOT_MENU_IDS,
+    DEFAULT_ROOT_MENU_ORDER,
     SCREEN_SAVER_BOOKS,
     SCREEN_SAVER_CHAPTER,
     SCREEN_SAVER_CLOCK,
@@ -32,14 +36,31 @@ from .config import (
     load_config,
     save_config,
     valid_library_sort_mode,
+    valid_long_press_seconds,
+    valid_acceleration_milliseconds,
+    valid_browse_return_seconds,
+    valid_marquee_delay,
+    valid_marquee_loop_pause,
+    valid_marquee_speed,
+    valid_navigation_acceleration_mode,
+    valid_root_menu_enabled,
+    valid_root_menu_order,
+    valid_screen_saver_idle_seconds,
     valid_playback_speed,
     valid_screen_saver_dim_percent,
     valid_screen_saver_mode,
     valid_sleep_timer_minutes,
 )
-from .library_cache import clear_cached_books
+from .library_cache import clear_cached_books, load_cached_books
+from .device_history import clear_device_playback_history, load_device_playback_history
 from .player_state import clear_last_playback
-from .player_control import WebPlayerStatus, load_web_player_status, queue_web_player_command
+from .player_control import (
+    WebPlayerStatus,
+    load_web_bluetooth_devices,
+    load_web_player_status,
+    queue_web_player_command,
+    save_web_bluetooth_devices,
+)
 from .podcast import PodcastError, resolve_podcast_config
 from .software_update import (
     UPDATE_SERVICE_NAME,
@@ -242,6 +263,27 @@ PAGE = """<!doctype html>
       border-radius: 0;
       accent-color: #2e7d79;
     }}
+    .chapter-buttons {{ display: flex; gap: 8px; margin-top: 10px; }}
+    .chapter-buttons button {{ width: auto; flex: 1; min-height: 40px; margin: 0; padding: 7px 10px; }}
+    .remote-card {{ margin-top: 14px; }}
+    .remote-toolbar {{ display: flex; flex-wrap: wrap; gap: 8px; margin: 12px 0; }}
+    .remote-toolbar button {{ width: auto; min-height: 40px; margin: 0; padding: 8px 12px; }}
+    .remote-toolbar button.is-active {{ background: #234f50; }}
+    .remote-search {{ margin: 0 0 12px; }}
+    .remote-library-list, .remote-recent-list {{ display: grid; gap: 8px; }}
+    .remote-book, .remote-group, .remote-recent-item {{
+      display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 10px; align-items: center;
+      padding: 10px; border: 1px solid #dfe6e3; border-radius: 8px; background: #f8faf9;
+    }}
+    .remote-book-title {{ font-weight: 750; overflow-wrap: anywhere; }}
+    .remote-book-meta {{ margin-top: 3px; color: #59616d; font-size: 0.84rem; }}
+    .remote-book-actions {{ display: flex; flex-wrap: wrap; gap: 6px; }}
+    .remote-book-actions button {{ width: auto; min-height: 36px; margin: 0; padding: 7px 10px; }}
+    .remote-group {{ width: 100%; text-align: left; color: #20242a; background: #f8faf9; }}
+    .remote-section {{ margin-top: 20px; }}
+    .remote-section h3 {{ margin: 0 0 8px; font-size: 0.98rem; }}
+    .remote-empty {{ padding: 10px 0; color: #59616d; }}
+    .remote-error {{ color: #9b2c2c; }}
     .message {{
       padding: 12px;
       border-radius: 6px;
@@ -262,6 +304,30 @@ PAGE = """<!doctype html>
       border-radius: 8px;
       overflow: hidden;
     }}
+    .navigation-settings-card {{
+      margin-top: 18px;
+      padding: 16px;
+      border: 1px solid #dfe6e3;
+      border-radius: 8px;
+      background: #f8faf9;
+    }}
+    .navigation-settings-card h3 {{ margin: 0; font-size: 1rem; }}
+    .navigation-settings-card .hint {{ margin: 5px 0 14px; }}
+    .navigation-settings-form {{ margin: 0; }}
+    .nav-settings-grid {{ display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px 14px; }}
+    .nav-settings-grid label {{ margin: 0; color: #59616d; font-size: 0.84rem; }}
+    .nav-settings-grid .settings-number, .nav-settings-grid .settings-select {{
+      display: block; box-sizing: border-box; width: 100%; min-height: 38px; margin-top: 4px;
+    }}
+    .root-menu-settings {{ min-width: 0; margin: 16px 0 0; padding: 10px 12px; border: 1px solid #dfe6e3; border-radius: 8px; }}
+    .root-menu-settings legend {{ padding: 0 5px; font-weight: 800; }}
+    .root-menu-row {{ display: grid; grid-template-columns: minmax(0, 1fr) 130px; gap: 10px; align-items: center; padding: 7px 0; border-top: 1px solid #e5ebe8; }}
+    .root-menu-row:first-child {{ border-top: 0; }}
+    .root-menu-enabled {{ display: flex; gap: 8px; align-items: center; margin: 0; }}
+    .root-menu-enabled input {{ width: 18px; min-height: 18px; margin: 0; }}
+    .root-menu-position {{ margin: 0; color: #59616d; font-size: 0.8rem; }}
+    .root-menu-position .settings-select {{ width: 100%; min-width: 0; margin-top: 3px; }}
+    .navigation-settings-form > button {{ margin-top: 12px; }}
     .settings-row {{
       display: grid;
       grid-template-columns: 1fr auto;
@@ -615,6 +681,9 @@ PAGE = """<!doctype html>
       .screen-saver-settings-form {{
         grid-template-columns: 1fr;
       }}
+      .nav-settings-grid {{ grid-template-columns: 1fr; }}
+      .remote-book, .remote-group, .remote-recent-item {{ grid-template-columns: 1fr; }}
+      .remote-book-actions {{ display: grid; grid-template-columns: 1fr 1fr; }}
       .podcast-row {{
         grid-template-columns: 1fr;
       }}
@@ -661,6 +730,7 @@ PAGE = """<!doctype html>
     </nav>
     <div class="tab-panel" id="panel-overview" role="tabpanel" aria-labelledby="tab-overview" data-tab-panel="overview">
       {status_panel}
+      {remote_control_panel}
     </div>
     <div class="tab-panel" id="panel-settings" role="tabpanel" aria-labelledby="tab-settings" data-tab-panel="settings" hidden>
       {settings_card}
@@ -923,6 +993,7 @@ PAGE = """<!doctype html>
       var actionInput = document.querySelector("[data-playback-action]");
       var actionButton = document.querySelector("[data-playback-button]");
       var playbackForm = document.querySelector("[data-playback-form]");
+      var chapterButtons = document.querySelector(".chapter-buttons");
       var volumeForm = document.querySelector("[data-volume-form]");
       if (!status.hasSession) {{
         pendingPlaybackAction = null;
@@ -941,6 +1012,9 @@ PAGE = """<!doctype html>
         if (volumeForm) {{
           volumeForm.classList.add("hidden");
         }}
+        if (chapterButtons) {{
+          chapterButtons.classList.add("hidden");
+        }}
         return;
       }}
       if (playerContainer) {{
@@ -951,6 +1025,9 @@ PAGE = """<!doctype html>
       }}
       if (volumeForm) {{
         volumeForm.classList.remove("hidden");
+      }}
+      if (chapterButtons) {{
+        chapterButtons.classList.remove("hidden");
       }}
       if (title) {{
         title.textContent = status.title;
@@ -1087,6 +1164,260 @@ PAGE = """<!doctype html>
           window.setTimeout(refreshPlayerStatus, 750);
       }});
     }}
+    var remoteBooks = [];
+    var remoteMode = "title";
+    var remoteGroup = "";
+    var remoteSearchText = "";
+    function getJson(url, callback) {{
+      var request = new XMLHttpRequest();
+      request.open("GET", url + (url.indexOf("?") >= 0 ? "&" : "?") + "_=" + Date.now(), true);
+      request.onreadystatechange = function() {{
+        if (request.readyState === 4) {{
+          if (request.status >= 200 && request.status < 300) {{
+            try {{ callback(JSON.parse(request.responseText), null); }} catch (error) {{ callback(null, error); }}
+          }} else {{ callback(null, new Error("Request failed")); }}
+        }}
+      }};
+      request.send();
+    }}
+    function textElement(tag, className, text) {{
+      var element = document.createElement(tag);
+      if (className) {{ element.className = className; }}
+      element.textContent = text || "";
+      return element;
+    }}
+    function appendEmpty(container, text, isError) {{
+      container.appendChild(textElement("div", "remote-empty" + (isError ? " remote-error" : ""), text));
+    }}
+    function postRemoteBook(bookId, startOver) {{
+      postPlayer({{action: "play_book", book_id: bookId, start_over: startOver ? "1" : "0"}}, function(status) {{
+        if (status >= 200 && status < 300) {{
+          window.setTimeout(refreshPlayerStatus, 300);
+          window.setTimeout(refreshRecentPlayback, 600);
+        }}
+      }});
+    }}
+    function addRemoteBook(container, book, recentlyPlayed) {{
+      var row = textElement("div", recentlyPlayed ? "remote-recent-item" : "remote-book", "");
+      var info = document.createElement("div");
+      info.appendChild(textElement("div", "remote-book-title", book.title || "Untitled"));
+      var metaParts = [];
+      if (book.author) {{ metaParts.push(book.author); }}
+      if (book.seriesName) {{
+        var seriesMeta = book.seriesName;
+        if (!recentlyPlayed && remoteMode === "series" && remoteGroup && book.seriesPosition) {{ seriesMeta += " · " + book.seriesPosition; }}
+        metaParts.push(seriesMeta);
+      }}
+      var duration = Number(book.duration || 0);
+      var currentTime = Number(book.currentTime || 0);
+      if (duration > 0 && currentTime > 0) {{
+        metaParts.push(Math.floor(currentTime / duration * 100) + "% listened · " + formatDuration(currentTime) + " / " + formatDuration(duration));
+      }} else if (book.progress > 0) {{
+        metaParts.push(Math.floor(book.progress * 100) + "% listened");
+      }}
+      if (recentlyPlayed && book.lastPlayedAt) {{
+        metaParts.push("Last played " + new Date(Number(book.lastPlayedAt) * 1000).toLocaleString());
+      }}
+      info.appendChild(textElement("div", "remote-book-meta", metaParts.join(" · ")));
+      var actions = textElement("div", "remote-book-actions", "");
+      var canContinue = Boolean(book.inProgress && !book.finished);
+      var playButton = textElement("button", "", canContinue ? "Continue" : "Play");
+      playButton.type = "button";
+      playButton.addEventListener("click", function() {{ postRemoteBook(book.id || book.bookId, Boolean(book.finished)); }});
+      actions.appendChild(playButton);
+      if (canContinue) {{
+        var startButton = textElement("button", "secondary", "Start over");
+        startButton.type = "button";
+        startButton.addEventListener("click", function() {{ postRemoteBook(book.id || book.bookId, true); }});
+        actions.appendChild(startButton);
+      }}
+      row.appendChild(info);
+      row.appendChild(actions);
+      container.appendChild(row);
+    }}
+    function remoteMatches(book, query) {{
+      if (!query) {{ return true; }}
+      var haystack = [book.title, book.author, book.seriesName, (book.authors || []).join(" ")].join(" ").toLowerCase();
+      return haystack.indexOf(query) >= 0;
+    }}
+    function renderRemoteLibrary() {{
+      var container = document.querySelector("[data-library-results]");
+      var backRow = document.querySelector("[data-group-back-row]");
+      if (!container) {{ return; }}
+      container.textContent = "";
+      var query = remoteSearchText.trim().toLowerCase();
+      var books = remoteBooks.slice();
+      if (remoteMode === "continue") {{
+        books = books.filter(function(book) {{ return book.inProgress && !book.finished; }});
+        books.sort(function(a, b) {{ return Number(b.lastUpdate || 0) - Number(a.lastUpdate || 0) || a.title.localeCompare(b.title); }});
+        books = books.filter(function(book) {{ return remoteMatches(book, query); }});
+        if (!books.length) {{ appendEmpty(container, "No in-progress books on this player’s library."); return; }}
+        books.forEach(function(book) {{ addRemoteBook(container, book, false); }});
+        return;
+      }}
+      if (remoteMode === "series" || remoteMode === "author") {{
+        var groups = {{}};
+        books.forEach(function(book) {{
+          var names = remoteMode === "series" ? (book.seriesName ? [book.seriesName] : []) : (book.authors || (book.author ? [book.author] : []));
+          names.forEach(function(name) {{
+            var key = String(name).trim();
+            if (!key) {{ return; }}
+            if (!groups[key]) {{ groups[key] = []; }}
+            if (!groups[key].some(function(existing) {{ return existing.id === book.id; }})) {{ groups[key].push(book); }}
+          }});
+        }});
+        if (remoteGroup) {{
+          backRow.hidden = false;
+          var groupBooks = (groups[remoteGroup] || []).filter(function(book) {{ return remoteMatches(book, query); }});
+          if (remoteMode === "series") {{
+            groupBooks.sort(function(a, b) {{
+              var aPosition = parseFloat(a.seriesPosition || "");
+              var bPosition = parseFloat(b.seriesPosition || "");
+              if (!isNaN(aPosition) && !isNaN(bPosition) && aPosition !== bPosition) {{ return aPosition - bPosition; }}
+              return a.title.localeCompare(b.title);
+            }});
+          }} else {{ groupBooks.sort(function(a, b) {{ return a.title.localeCompare(b.title); }}); }}
+          if (!groupBooks.length) {{ appendEmpty(container, "No matching books in this group."); return; }}
+          groupBooks.forEach(function(book) {{ addRemoteBook(container, book, false); }});
+          return;
+        }}
+        backRow.hidden = true;
+        var groupNames = Object.keys(groups).filter(function(name) {{
+          return name.toLowerCase().indexOf(query) >= 0 || groups[name].some(function(book) {{ return remoteMatches(book, query); }});
+        }}).sort(function(a, b) {{ return a.localeCompare(b); }});
+        if (!groupNames.length) {{ appendEmpty(container, "No matching groups found."); return; }}
+        groupNames.forEach(function(name) {{
+          var button = textElement("button", "remote-group", name + " · " + groups[name].length + (groups[name].length === 1 ? " book" : " books"));
+          button.type = "button";
+          button.addEventListener("click", function() {{ remoteGroup = name; renderRemoteLibrary(); }});
+          container.appendChild(button);
+        }});
+        return;
+      }}
+      if (backRow) {{ backRow.hidden = true; }}
+      books = books.filter(function(book) {{ return remoteMatches(book, query); }});
+      books.sort(function(a, b) {{ return a.title.localeCompare(b.title); }});
+      if (!books.length) {{ appendEmpty(container, "No matching books found."); return; }}
+      books.forEach(function(book) {{ addRemoteBook(container, book, false); }});
+    }}
+    function refreshRemoteLibrary() {{
+      getJson("/library/books", function(data, error) {{
+        if (error || !data || !Array.isArray(data.books)) {{
+          var container = document.querySelector("[data-library-results]");
+          if (container) {{ container.textContent = ""; appendEmpty(container, "Could not load the cached library. Refresh the library or check the connection.", true); }}
+          return;
+        }}
+        remoteBooks = data.books;
+        renderRemoteLibrary();
+      }});
+    }}
+    function refreshRecentPlayback() {{
+      var container = document.querySelector("[data-recent-results]");
+      if (!container) {{ return; }}
+      getJson("/player/recent", function(data, error) {{
+        container.textContent = "";
+        if (error || !data || !Array.isArray(data.items)) {{ appendEmpty(container, "Could not load device history.", true); return; }}
+        if (!data.items.length) {{ appendEmpty(container, "No books have been played on this device yet."); return; }}
+        data.items.forEach(function(item) {{
+          addRemoteBook(container, {{bookId: item.bookId, title: item.title, author: item.author, currentTime: item.currentTime, duration: item.duration, progress: item.progress, lastPlayedAt: item.lastPlayedAt, inProgress: item.progress > 0 && item.progress < 0.995, finished: item.progress >= 0.995}}, true);
+        }});
+      }});
+    }}
+    function renderBluetoothDevices(data) {{
+      var container = document.querySelector("[data-bluetooth-devices]");
+      if (!container) {{ return; }}
+      container.textContent = "";
+      var devices = data && Array.isArray(data.devices) ? data.devices : [];
+      if (!devices.length) {{ appendEmpty(container, "Scan to find nearby audio devices."); return; }}
+      devices.forEach(function(device) {{
+        var row = textElement("div", "remote-book", "");
+        var info = document.createElement("div");
+        info.appendChild(textElement("div", "remote-book-title", device.name));
+        info.appendChild(textElement("div", "remote-book-meta", device.address));
+        var actions = textElement("div", "remote-book-actions", "");
+        var pair = textElement("button", "", "Connect");
+        pair.type = "button";
+        pair.addEventListener("click", function() {{
+          var message = document.querySelector("[data-bluetooth-message]");
+          if (message) {{ message.textContent = "Connecting to " + device.name + "…"; }}
+          postPlayer({{action: "bluetooth_pair", device_address: device.address, device_name: device.name}}, function() {{
+            window.setTimeout(refreshPlayerStatus, 500);
+          }});
+        }});
+        actions.appendChild(pair);
+        row.appendChild(info);
+        row.appendChild(actions);
+        container.appendChild(row);
+      }});
+    }}
+    function refreshBluetoothDevices() {{
+      getJson("/bluetooth/devices", function(data, error) {{
+        if (!error) {{ renderBluetoothDevices(data); }}
+      }});
+    }}
+    function pollBluetoothScan(startedAt, deadline) {{
+      getJson("/bluetooth/devices", function(data, error) {{
+        var message = document.querySelector("[data-bluetooth-message]");
+        if (!error && data && !data.scanning && Number(data.updatedAt || 0) >= startedAt) {{
+          renderBluetoothDevices(data);
+          if (message) {{ message.textContent = data.devices.length ? "Choose a device to connect." : "No audio devices found. Try scanning again."; }}
+          refreshPlayerStatus();
+          return;
+        }}
+        if (Date.now() >= deadline) {{
+          if (message) {{ message.textContent = "Bluetooth scan timed out. Try again."; }}
+          return;
+        }}
+        window.setTimeout(function() {{ pollBluetoothScan(startedAt, deadline); }}, 1500);
+      }});
+    }}
+    document.querySelectorAll("[data-bluetooth-command]").forEach(function(button) {{
+      button.addEventListener("click", function() {{
+        var action = button.getAttribute("data-bluetooth-command");
+        var message = document.querySelector("[data-bluetooth-message]");
+        if (message) {{ message.textContent = action === "bluetooth_scan" ? "Scanning for audio devices…" : "Bluetooth command sent."; }}
+        if (action === "bluetooth_scan") {{
+          var scanStartedAt = Date.now() / 1000 - 1;
+          postPlayer({{action: action}}, function() {{ pollBluetoothScan(scanStartedAt, Date.now() + 40000); }});
+        }} else {{
+          postPlayer({{action: action}}, function() {{ window.setTimeout(refreshPlayerStatus, 500); }});
+        }}
+      }});
+    }});
+    refreshBluetoothDevices();
+    document.querySelectorAll("[data-browse-mode]").forEach(function(button) {{
+      button.addEventListener("click", function() {{
+        remoteMode = button.getAttribute("data-browse-mode");
+        remoteGroup = "";
+        document.querySelectorAll("[data-browse-mode]").forEach(function(choice) {{ choice.classList.toggle("is-active", choice === button); }});
+        renderRemoteLibrary();
+      }});
+    }});
+    var librarySearch = document.querySelector("[data-library-search]");
+    if (librarySearch) {{ librarySearch.addEventListener("input", function() {{ remoteSearchText = librarySearch.value; renderRemoteLibrary(); }}); }}
+    var backToGroupsButton = document.querySelector("[data-back-groups]");
+    if (backToGroupsButton) {{ backToGroupsButton.addEventListener("click", function() {{ remoteGroup = ""; renderRemoteLibrary(); }}); }}
+    var clearRecentButton = document.querySelector("[data-clear-recent]");
+    if (clearRecentButton) {{ clearRecentButton.addEventListener("click", function() {{
+      postPlayer({{action: "clear_recent"}}, function(status) {{ if (status >= 200 && status < 300) {{ refreshRecentPlayback(); }} }});
+    }}); }}
+    var libraryRefreshButton = document.querySelector("[data-library-refresh]");
+    if (libraryRefreshButton) {{ libraryRefreshButton.addEventListener("click", function() {{
+      libraryRefreshButton.disabled = true;
+      postPlayer({{action: "refresh_books"}}, function() {{
+        window.setTimeout(function() {{ refreshRemoteLibrary(); libraryRefreshButton.disabled = false; }}, 1500);
+      }});
+    }}); }}
+    document.querySelectorAll("[data-player-command]").forEach(function(button) {{
+      button.addEventListener("click", function() {{
+        postPlayer({{action: button.getAttribute("data-player-command")}}, function() {{
+          window.setTimeout(refreshPlayerStatus, 300);
+          window.setTimeout(refreshPlayerStatus, 800);
+        }});
+      }});
+    }});
+    refreshRemoteLibrary();
+    refreshRecentPlayback();
     function addPodcastRow(value) {{
       if (!podcastRows) {{
         return;
@@ -1254,6 +1585,15 @@ class SetupHandler(BaseHTTPRequestHandler):
         if path == "/player/status":
             self.send_player_status_json()
             return
+        if path == "/player/recent":
+            self.send_recent_player_history_json()
+            return
+        if path == "/library/books":
+            self.send_library_books_json()
+            return
+        if path == "/bluetooth/devices":
+            self.send_json(load_web_bluetooth_devices())
+            return
         if path == "/system/update/status":
             self.send_system_update_status_json()
             return
@@ -1276,6 +1616,20 @@ class SetupHandler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:
         path = urlparse(self.path).path
+        if path == "/internal/shutdown":
+            try:
+                is_loopback = ipaddress.ip_address(self.client_address[0]).is_loopback
+            except ValueError:
+                is_loopback = False
+            if not is_loopback:
+                self.send_error(403, "Shutdown is available only to local device services.")
+                return
+            self.send_response(202)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            schedule_system_shutdown()
+            return
+
         handlers = {
             "/wifi": self.handle_wifi_post,
             "/wifi/forget": self.handle_forget_wifi_post,
@@ -1283,6 +1637,7 @@ class SetupHandler(BaseHTTPRequestHandler):
             "/settings/click": self.handle_click_setting_post,
             "/settings/spoken-navigation": self.handle_spoken_navigation_setting_post,
             "/settings/library-order": self.handle_library_sort_setting_post,
+            "/settings/navigation": self.handle_navigation_settings_post,
             "/settings/playback-speed": self.handle_playback_speed_setting_post,
             "/settings/screensaver": self.handle_screen_saver_setting_post,
             "/settings/sleep": self.handle_sleep_setting_post,
@@ -1346,10 +1701,7 @@ class SetupHandler(BaseHTTPRequestHandler):
 
         schedule_wifi_connect(ssid, password)
         self.send_page(
-            message=(
-                "Wi-Fi change submitted. The player will switch networks in a moment. "
-                "Hold the volume knob for 10 seconds to show the new setup address."
-            )
+            message="Wi-Fi change submitted. The player will switch networks in a moment."
         )
 
     def handle_forget_wifi_post(self) -> None:
@@ -1392,8 +1744,55 @@ class SetupHandler(BaseHTTPRequestHandler):
             return
         action = one(fields, "action")
 
-        if action in {"play", "pause"}:
+        if action in {"play", "pause", "toggle"}:
             queue_web_player_command(action)
+            self.send_player_command_response()
+            return
+
+        if action in {"previous_chapter", "next_chapter"}:
+            queue_web_player_command(action)
+            self.send_player_command_response()
+            return
+
+        if action in {"bluetooth_enable", "bluetooth_disable", "bluetooth_scan", "bluetooth_unpair"}:
+            if action == "bluetooth_scan":
+                save_web_bluetooth_devices([], scanning=True)
+            queue_web_player_command(action)
+            self.send_player_command_response()
+            return
+
+        if action == "bluetooth_pair":
+            device_address = one(fields, "device_address").upper()
+            device_name = one(fields, "device_name")
+            if not MAC_ADDRESS_PATTERN.fullmatch(device_address) or not device_name:
+                self.send_request_error(400, "Choose a valid Bluetooth device from a recent scan.")
+                return
+            queue_web_player_command(
+                action,
+                device_address=device_address,
+                device_name=device_name,
+            )
+            self.send_player_command_response()
+            return
+
+        if action == "play_book":
+            book_id = one(fields, "book_id").strip()
+            book = next((item for item in load_cached_books(load_config()) if item.id == book_id), None)
+            if book is None:
+                self.send_request_error(404, "That book is not in the player's current library cache.")
+                return
+            start_over = one(fields, "start_over") == "1"
+            queue_web_player_command(
+                action,
+                book_id=book.id,
+                start_over=start_over,
+                resume_time=0.0 if start_over else book.current_time,
+            )
+            self.send_player_command_response()
+            return
+
+        if action == "clear_recent":
+            clear_device_playback_history()
             self.send_player_command_response()
             return
 
@@ -1423,6 +1822,13 @@ class SetupHandler(BaseHTTPRequestHandler):
             return
         enabled = one(fields, "enabled") == "1"
         save_spoken_navigation_setting(enabled)
+        self.redirect_home()
+
+    def handle_navigation_settings_post(self) -> None:
+        fields = self.post_fields()
+        if fields is None:
+            return
+        save_navigation_settings(fields)
         self.redirect_home()
 
     def handle_library_sort_setting_post(self) -> None:
@@ -1535,6 +1941,7 @@ class SetupHandler(BaseHTTPRequestHandler):
                 bluetooth_status(),
                 csrf_token,
             ),
+            remote_control_panel=render_remote_control_panel(csrf_token),
             settings_card=render_settings_card(config, csrf_token),
             podcasts_card=render_podcasts_card(config, csrf_token),
             wifi_card=render_wifi_card(wifi, csrf_token),
@@ -1596,7 +2003,7 @@ class SetupHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
-    def send_json(self, data: dict) -> None:
+    def send_json(self, data: dict | list) -> None:
         body = json.dumps(data).encode("utf-8")
         self.send_response(200)
         self.send_header("Content-Type", "application/json; charset=utf-8")
@@ -1607,6 +2014,57 @@ class SetupHandler(BaseHTTPRequestHandler):
 
     def send_player_status_json(self) -> None:
         self.send_json(player_status_payload(load_web_player_status()))
+
+    def send_recent_player_history_json(self) -> None:
+        self.send_json(
+            {
+                "items": [
+                    {
+                        "bookId": item.book_id,
+                        "title": item.title,
+                        "author": item.author,
+                        "currentTime": item.current_time,
+                        "duration": item.duration,
+                        "startedAt": item.started_at,
+                        "lastPlayedAt": item.last_played_at,
+                        "progress": item.current_time / item.duration if item.duration > 0 else 0.0,
+                    }
+                    for item in load_device_playback_history(30)
+                ]
+            }
+        )
+
+    def send_library_books_json(self) -> None:
+        config = load_config()
+        books = load_cached_books(config)
+        recent_by_id = {item.book_id: item for item in load_device_playback_history(50)}
+        payload = []
+        for book in books:
+            recent = recent_by_id.get(book.id)
+            last_update = timestamp_seconds(book.last_update)
+            if recent is not None and recent.last_played_at >= last_update:
+                book.current_time = recent.current_time
+                book.duration = recent.duration or book.duration
+                book.progress = book.current_time / book.duration if book.duration > 0 else book.progress
+                book.finished = book.progress >= 0.995
+                last_update = recent.last_played_at
+            payload.append(
+                {
+                    "id": book.id,
+                    "title": book.display_title,
+                    "author": book.author,
+                    "authors": list(book.authors),
+                    "seriesName": book.series_name,
+                    "seriesPosition": book.series_position,
+                    "duration": book.duration,
+                    "currentTime": book.current_time,
+                    "progress": book.progress,
+                    "finished": book.is_finished,
+                    "inProgress": book.is_in_progress,
+                    "lastUpdate": last_update,
+                }
+            )
+        self.send_json({"books": payload, "count": len(payload)})
 
     def send_system_update_status_json(self) -> None:
         self.send_json(update_status_payload())
@@ -1674,6 +2132,14 @@ def one(fields: dict[str, list[str]], name: str) -> str:
     return fields.get(name, [""])[0].strip()
 
 
+def timestamp_seconds(value: object) -> float:
+    try:
+        timestamp = float(value or 0)
+    except (TypeError, ValueError):
+        return 0.0
+    return timestamp / 1000.0 if timestamp >= 100_000_000_000 else timestamp
+
+
 def render_csrf_input(csrf_token: str) -> str:
     return (
         f'<input type="hidden" name="{CSRF_FIELD_NAME}" '
@@ -1733,6 +2199,22 @@ def schedule_system_reboot(
     timer.start()
 
 
+def schedule_system_shutdown(
+    delay_seconds: float = SYSTEM_ACTION_DELAY_SECONDS,
+    runner: SystemCommandRunner = run_system_command,
+) -> None:
+    def worker() -> None:
+        try:
+            print("System shutdown starting", flush=True)
+            runner(["systemctl", "poweroff"])
+        except (OSError, subprocess.CalledProcessError) as error:
+            print(f"System shutdown failed: {error}", flush=True)
+
+    timer = threading.Timer(delay_seconds, worker)
+    timer.daemon = True
+    timer.start()
+
+
 def schedule_software_update(
     delay_seconds: float = SYSTEM_ACTION_DELAY_SECONDS,
     runner: SystemCommandRunner = run_system_command,
@@ -1764,6 +2246,8 @@ def restore_device_defaults() -> AppConfig:
     save_config(config)
     clear_cached_books()
     clear_last_playback()
+    clear_device_playback_history()
+    save_web_bluetooth_devices([])
     queue_web_player_command("refresh_library")
     return config
 
@@ -1815,6 +2299,66 @@ def save_click_setting(enabled: bool) -> AppConfig:
 def save_spoken_navigation_setting(enabled: bool) -> AppConfig:
     config = load_config()
     updated = replace(config, spoken_navigation_enabled=enabled)
+    save_config(updated)
+    return updated
+
+
+def save_navigation_settings(fields: dict[str, list[str]]) -> AppConfig:
+    config = load_config()
+    order_with_positions = []
+    for fallback_position, menu_id in enumerate(DEFAULT_ROOT_MENU_ORDER):
+        try:
+            position = int(one(fields, f"menu_order_{menu_id}"))
+        except ValueError:
+            position = fallback_position
+        order_with_positions.append((max(0, min(20, position)), fallback_position, menu_id))
+    order = valid_root_menu_order(
+        [menu_id for _position, _fallback, menu_id in sorted(order_with_positions)]
+    )
+    enabled = valid_root_menu_enabled(fields.get("menu_enabled", []))
+    updated = replace(
+        config,
+        knob_hold_seconds=valid_long_press_seconds(one(fields, "knob_hold_seconds"), config.knob_hold_seconds),
+        marquee_delay_seconds=(
+            valid_marquee_delay(one(fields, "marquee_delay_seconds"))
+            if "marquee_delay_seconds" in fields
+            else config.marquee_delay_seconds
+        ),
+        marquee_speed_px_per_second=(
+            valid_marquee_speed(one(fields, "marquee_speed_px_per_second"))
+            if "marquee_speed_px_per_second" in fields
+            else config.marquee_speed_px_per_second
+        ),
+        marquee_loop_pause_seconds=(
+            valid_marquee_loop_pause(one(fields, "marquee_loop_pause_seconds"))
+            if "marquee_loop_pause_seconds" in fields
+            else config.marquee_loop_pause_seconds
+        ),
+        navigation_acceleration_mode=valid_navigation_acceleration_mode(
+            one(fields, "navigation_acceleration_mode")
+            if "navigation_acceleration_mode" in fields
+            else config.navigation_acceleration_mode
+        ),
+        navigation_accel_threshold_milliseconds=valid_acceleration_milliseconds(
+            one(fields, "navigation_accel_threshold_milliseconds")
+            if "navigation_accel_threshold_milliseconds" in fields
+            else config.navigation_accel_threshold_milliseconds,
+            config.navigation_accel_threshold_milliseconds,
+        ),
+        startup_resume_last_played=one(fields, "startup_resume_last_played").lower() in {"1", "true", "on", "yes"},
+        browse_return_seconds=(
+            valid_browse_return_seconds(one(fields, "browse_return_seconds"))
+            if "browse_return_seconds" in fields
+            else config.browse_return_seconds
+        ),
+        screen_saver_idle_seconds=(
+            valid_screen_saver_idle_seconds(one(fields, "screen_saver_idle_seconds"))
+            if "screen_saver_idle_seconds" in fields
+            else config.screen_saver_idle_seconds
+        ),
+        root_menu_order=order,
+        root_menu_enabled=enabled,
+    )
     save_config(updated)
     return updated
 
@@ -1973,6 +2517,50 @@ def render_status_panel(
     )
 
 
+def render_remote_control_panel(csrf_token: str = "") -> str:
+    return """
+    <section class="card remote-card" aria-labelledby="remote-heading">
+      <h2 id="remote-heading">Remote control</h2>
+      <p class="hint">Browse this player’s cached library and start a book without using the knobs.</p>
+      <div class="remote-toolbar" role="group" aria-label="Browse library">
+        <button class="is-active" type="button" data-browse-mode="title">Titles</button>
+        <button type="button" data-browse-mode="continue">Continue listening</button>
+        <button type="button" data-browse-mode="series">Series</button>
+        <button type="button" data-browse-mode="author">Authors</button>
+        <button class="secondary" type="button" data-library-refresh>Refresh library</button>
+      </div>
+      <div class="remote-toolbar" data-group-back-row hidden>
+        <button class="secondary" type="button" data-back-groups>Back to groups</button>
+      </div>
+      <label class="sr-only" for="remote-library-search">Search the library</label>
+      <input class="remote-search" id="remote-library-search" type="search" placeholder="Search title, author, or series" data-library-search>
+      <div class="remote-library-list" data-library-results aria-live="polite">
+        <div class="remote-empty">Loading the player’s library…</div>
+      </div>
+      <div class="remote-section">
+        <h3>Recently played on this player</h3>
+        <p class="hint">This history is stored on the Chapter device and is separate from your Audiobookshelf account history.</p>
+        <div class="remote-recent-list" data-recent-results aria-live="polite">
+          <div class="remote-empty">Loading recent playback…</div>
+        </div>
+        <button class="small-button secondary" type="button" data-clear-recent>Clear this player’s history</button>
+      </div>
+      <div class="remote-section">
+        <h3>Bluetooth audio</h3>
+        <p class="hint">Manage the headphones or speaker connected to this Chapter player.</p>
+        <div class="remote-toolbar" role="group" aria-label="Bluetooth controls">
+          <button class="secondary" type="button" data-bluetooth-command="bluetooth_enable">Turn Bluetooth on</button>
+          <button class="secondary" type="button" data-bluetooth-command="bluetooth_disable">Turn Bluetooth off</button>
+          <button class="secondary" type="button" data-bluetooth-command="bluetooth_scan">Scan for devices</button>
+          <button class="secondary" type="button" data-bluetooth-command="bluetooth_unpair">Disconnect device</button>
+        </div>
+        <div class="remote-book-meta" data-bluetooth-message aria-live="polite"></div>
+        <div class="remote-library-list" data-bluetooth-devices></div>
+      </div>
+    </section>
+    """
+
+
 def render_system_card(csrf_token: str = "") -> str:
     return """
     <section class="card" aria-labelledby="system-heading">
@@ -2037,6 +2625,48 @@ def render_system_card(csrf_token: str = "") -> str:
       </div>
     </section>
     """.format(version=html.escape(__version__), csrf_input=render_csrf_input(csrf_token))
+
+
+def render_root_menu_rows(config: AppConfig) -> str:
+    labels = {
+        "continue": "Continue Listening",
+        "series": "Browse by Series",
+        "title": "Browse by Title",
+        "author": "Browse by Author",
+        "bluetooth": "Bluetooth Settings",
+        "shutdown": "Push and hold both knobs to turn off device",
+    }
+    order = valid_root_menu_order(config.root_menu_order)
+    enabled = set(valid_root_menu_enabled(config.root_menu_enabled))
+    rows = []
+    for menu_id in ROOT_MENU_IDS:
+        position = order.index(menu_id) + 1
+        options = "".join(
+            f'<option value="{value}"{" selected" if value == position else ""}>{value}</option>'
+            for value in range(1, len(ROOT_MENU_IDS) + 1)
+        )
+        rows.append(
+            """
+            <div class="root-menu-row">
+              <label class="root-menu-enabled">
+                <input type="checkbox" name="menu_enabled" value="{menu_id}"{checked}>
+                <span>{label}</span>
+              </label>
+              <label class="root-menu-position">
+                Position
+                <select class="settings-select" name="menu_order_{menu_id}" aria-label="{label} position">
+                  {options}
+                </select>
+              </label>
+            </div>
+            """.format(
+                menu_id=menu_id,
+                label=html.escape(labels[menu_id]),
+                checked=" checked" if menu_id in enabled else "",
+                options=options,
+            )
+        )
+    return "\n".join(rows)
 
 
 def render_settings_card(config: AppConfig, csrf_token: str = "") -> str:
@@ -2104,18 +2734,6 @@ def render_settings_card(config: AppConfig, csrf_token: str = "") -> str:
         </div>
         <div class="settings-row">
           <div>
-            <div class="setting-name">Library order</div>
-          </div>
-          <form class="select-form" method="post" action="/settings/library-order">
-            {csrf_input}
-            <select class="settings-select" name="library_sort_mode" aria-label="Library order">
-              {library_sort_options}
-            </select>
-            <button class="small-button secondary" type="submit">Save</button>
-          </form>
-        </div>
-        <div class="settings-row">
-          <div>
             <div class="setting-name">Playback speed</div>
           </div>
           <form class="select-form" method="post" action="/settings/playback-speed">
@@ -2161,6 +2779,52 @@ def render_settings_card(config: AppConfig, csrf_token: str = "") -> str:
           </form>
         </div>
       </div>
+      <div class="navigation-settings-card">
+        <h3>Navigation and display</h3>
+        <p class="hint">Navigation and display changes take effect while the player is running. The startup choice applies next time it starts.</p>
+        <form class="navigation-settings-form" method="post" action="/settings/navigation">
+          {csrf_input}
+          <div class="nav-settings-grid">
+            <label>Knob hold (seconds)
+              <input class="settings-number" name="knob_hold_seconds" type="number" min="0.5" max="5" step="0.1" value="{knob_hold_seconds}">
+              <span class="hint">Applies to individual knob holds and the two-knob shutdown gesture.</span>
+            </label>
+            <label>Marquee start delay (seconds)
+              <input class="settings-number" name="marquee_delay_seconds" type="number" min="0" max="5" step="0.05" value="{marquee_delay_seconds}">
+            </label>
+            <label>Marquee speed (pixels/second)
+              <input class="settings-number" name="marquee_speed_px_per_second" type="number" min="8" max="120" step="1" value="{marquee_speed}">
+            </label>
+            <label>Pause between marquee loops (seconds)
+              <input class="settings-number" name="marquee_loop_pause_seconds" type="number" min="0" max="10" step="0.1" value="{marquee_loop_pause_seconds}">
+            </label>
+            <label>Knob acceleration multiplier
+              <select class="settings-select" name="navigation_acceleration_mode">{acceleration_options}</select>
+            </label>
+            <label>Fast-turn threshold (milliseconds)
+              <input class="settings-number" name="navigation_accel_threshold_milliseconds" type="number" min="10" max="500" step="5" value="{accel_threshold_ms}">
+              <span class="hint">Acceleration applies when the time between knob steps is at or below this value. Lower values require a faster turn.</span>
+            </label>
+            <label>Return to playback after browsing (seconds; 0 disables)
+              <input class="settings-number" name="browse_return_seconds" type="number" min="0" max="120" step="1" value="{browse_return_seconds}">
+            </label>
+            <label>Screen saver idle time (seconds; 0 disables)
+              <input class="settings-number" name="screen_saver_idle_seconds" type="number" min="0" max="3600" step="30" value="{screen_saver_idle_seconds}">
+            </label>
+          </div>
+          <label class="root-menu-enabled startup-resume-setting">
+            <input type="checkbox" name="startup_resume_last_played" value="true"{startup_resume_checked}>
+            <span>Open your latest in-progress book at startup</span>
+          </label>
+          <p class="hint">Uses your Audiobookshelf account’s listening progress. When off, startup selects the first item in the root menu.</p>
+          <fieldset class="root-menu-settings">
+            <legend>Root menu choices and order</legend>
+            <div class="root-menu-list">{root_menu_rows}</div>
+            <p class="hint">Choose which sections appear and their order. At least one stays enabled.</p>
+          </fieldset>
+          <button class="small-button secondary" type="submit">Save navigation settings</button>
+        </form>
+      </div>
     </section>
     """.format(
         next_value=next_value,
@@ -2171,7 +2835,6 @@ def render_settings_card(config: AppConfig, csrf_token: str = "") -> str:
         spoken_navigation_toggle_class=spoken_navigation_toggle_class,
         spoken_navigation_aria_pressed=spoken_navigation_aria_pressed,
         spoken_navigation_button_label=spoken_navigation_button_label,
-        library_sort_options=render_library_sort_options(config.library_sort_mode),
         playback_speed_options=render_playback_speed_options(config.playback_speed),
         screen_saver_options=render_screen_saver_options(config.screen_saver_mode),
         screen_saver_dim_options=render_screen_saver_dim_options(config.screen_saver_dim_percent),
@@ -2180,6 +2843,16 @@ def render_settings_card(config: AppConfig, csrf_token: str = "") -> str:
         sleep_aria_pressed=sleep_aria_pressed,
         sleep_button_label=sleep_button_label,
         sleep_duration_controls=sleep_duration_controls,
+        knob_hold_seconds=config.knob_hold_seconds,
+        marquee_delay_seconds=config.marquee_delay_seconds,
+        marquee_speed=config.marquee_speed_px_per_second,
+        marquee_loop_pause_seconds=config.marquee_loop_pause_seconds,
+        acceleration_options=render_acceleration_options(config.navigation_acceleration_mode),
+        accel_threshold_ms=config.navigation_accel_threshold_milliseconds,
+        browse_return_seconds=config.browse_return_seconds,
+        screen_saver_idle_seconds=config.screen_saver_idle_seconds,
+        startup_resume_checked=" checked" if config.startup_resume_last_played else "",
+        root_menu_rows=render_root_menu_rows(config),
         csrf_input=csrf_input,
     )
 
@@ -2248,6 +2921,17 @@ def render_screen_saver_options(selected_mode: str) -> str:
     )
 
 
+def render_acceleration_options(selected_mode: str) -> str:
+    return "\n".join(
+        '<option value="{value}"{selected}>{label}</option>'.format(
+            value=value,
+            selected=" selected" if value == selected_mode else "",
+            label="Off" if value == "off" else value,
+        )
+        for value in NAV_ACCELERATION_MODES
+    )
+
+
 def render_library_sort_options(selected_mode: str) -> str:
     options = (
         (LIBRARY_SORT_TITLE, "Title"),
@@ -2308,6 +2992,10 @@ def render_player_status_value(status: WebPlayerStatus, csrf_token: str = "") ->
         <input data-playback-action type="hidden" name="action" value="{button_action}">
         <button data-playback-button type="submit">{button_text}</button>
       </form>
+      <div class="chapter-buttons{hidden_class}">
+        <button class="secondary" type="button" data-player-command="previous_chapter">Previous chapter</button>
+        <button class="secondary" type="button" data-player-command="next_chapter">Next chapter</button>
+      </div>
       <form class="volume-form{hidden_class}" data-volume-form method="post" action="/player">
         {csrf_input}
         <input type="hidden" name="action" value="volume">
@@ -2341,6 +3029,7 @@ def player_status_payload(status: WebPlayerStatus) -> dict:
         state = "Muted"
     return {
         "hasSession": status.has_session,
+        "bookId": status.book_id,
         "title": status.title,
         "state": state,
         "timeInfo": render_time_info(status),
@@ -2355,6 +3044,7 @@ def player_status_payload(status: WebPlayerStatus) -> dict:
 def player_status_event_signature(payload: dict) -> str:
     important = {
         "hasSession": payload.get("hasSession"),
+        "bookId": payload.get("bookId"),
         "title": payload.get("title"),
         "state": payload.get("state"),
         "isPlaying": payload.get("isPlaying"),

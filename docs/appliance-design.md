@@ -28,8 +28,11 @@ This display changes the product shape: cover art should not be shown on-device.
 
 Use two KY-040 rotary encoder modules, labeled `Select` and `Volume` on the case:
 
-- Select knob: browse books, choose continue/start-over, play/pause, and confirm chapter navigation.
-- Volume knob: turn for volume, short-click for mute/unmute, and hold for 10 seconds to show the setup IP.
+- Select knob: browse and select items; hold to go back one level.
+- Volume knob: turn for volume, click to play/pause and return to playback, and hold to return to the root menu.
+- Both knobs together: hold to request a clean system shutdown.
+
+The hold duration is one shared setting for both individual knob holds and the shutdown gesture. It defaults to one second and can be changed in the setup page.
 
 The KY-040 has `CLK`, `DT`, `SW`, `+`, and `GND` pins. Power each module from the Pi's 3.3V rail, not 5V, so its pull-ups never expose a Raspberry Pi GPIO input to 5V. If clockwise/counter-clockwise feels reversed after mounting, either swap `CLK` and `DT` or set the encoder's `reversed` flag in software.
 
@@ -77,32 +80,38 @@ Kids Player UI
 
 ## Two-Line UI
 
-### Library
+### Root Menu And Library
+
+The first root-menu choice is `Continue Listening` by default. The other choices are `Browse by Series`, `Browse by Title`, `Browse by Author`, and `Bluetooth Settings`. The setup page can reorder or hide root choices. A shutdown instruction can also be shown in this list; the two-knob shutdown gesture remains active if the instruction is hidden.
+
+`Continue Listening` uses the Audiobookshelf user's in-progress books, sorted by latest progress activity, and excludes finished books. The second line shows progress. The menu can also be configured to show a resume prompt for the user's most recently updated in-progress book at startup.
+
+`Browse by Series` and `Browse by Author` show groups and book counts. Selecting a group opens its books. The player uses the primary series supplied by Audiobookshelf; a book's series position appears only in its series view. `Browse by Title` displays the plain audiobook title without a series prefix.
+
+```text
+Top:    audiobook title or menu choice
+Bottom: author, progress, or menu context
+```
+
+Turn the Select knob to move through the current list and click to open an item. Long titles scroll horizontally. Start delay, scroll speed, and pause at the start of each loop are configurable.
+
+### Resume Choice
 
 ```text
 Top:    audiobook title
-Bottom: By author
+Bottom: Back | Continue | Start over
 ```
 
-Turn the Select knob to move through titles. Click it to open the selected title.
-
-### Continue or Start Over
-
-```text
-Top:    audiobook title
-Bottom: Home | Continue | Start over
-```
-
-When the selected book has listening history, `Continue` is the default selection. Turn the Select knob to move between `Home`, `Continue`, and `Start over`, then click to choose. If the book has no listening history, show only `Home` and `Start`.
+When the selected book has listening history, `Continue` is the default selection. Turn the Select knob to move between `Back`, `Continue`, and `Start over`, then click to choose. If the book has no listening history, show only `Back` and `Start`.
 
 ### Playing
 
 ```text
 Top:    scrolling chapter title with remaining time at the upper-right
-Bottom: Home | Prev | Play/Pause | Next
+Bottom: Back | Prev | Play/Pause | Next
 ```
 
-The Select knob moves left and right through the action row, stopping at the edges. Click it to choose the focused action. `Play/Pause` is focused by default when playback starts. `Prev` and `Next` ask for confirmation before changing chapters. Returning to `Home` while audio continues playing automatically returns to this playback screen after five seconds without input.
+The Select knob moves through the action row. The row starts at `Back`, followed by `Prev`, `Play/Pause`, and `Next`. Click the Select knob to choose an action. `Play/Pause` is focused by default when playback starts. `Prev` and `Next` ask for confirmation before changing chapters. `Back` returns to the previous navigation screen. If a book continues playing while the user browses, the display returns to playback after 10 seconds without input by default; this timeout is configurable.
 
 Long chapter titles scroll horizontally while the remaining-time display and bottom action row stay fixed.
 
@@ -113,7 +122,7 @@ Top:    Are you sure you want to listen to the previous/next chapter?
 Bottom: Yes | No
 ```
 
-Turn the Select knob to switch between `Yes` and `No`. Click to confirm. The prompt returns to the playback screen after five seconds without input.
+Turn the Select knob to switch between `Yes` and `No`. Click to confirm. The prompt returns to the playback screen after its short confirmation timeout.
 
 ### Volume
 
@@ -121,10 +130,11 @@ The Volume knob is global:
 
 - Turn clockwise: volume up
 - Turn counter-clockwise: volume down
-- Short click: mute/unmute
-- Hold for 10 seconds: show the setup web page IP address on the OLED for 5 seconds
+- Click: toggle play/pause and return to the playback screen when a book is loaded
+- Hold: return to the first root-menu item
+- Hold both knobs together: cleanly shut down Linux, save playback progress, and power off
 
-The long hold should not also toggle mute.
+The two-knob shutdown gesture works from any display or menu. It is separate from the optional shutdown instruction in the root menu. Wait for the system to power off before disconnecting its supply.
 
 When volume is adjusted, replace the current OLED screen with a temporary volume overlay:
 
@@ -135,6 +145,10 @@ Bottom: rounded graphical fill bar
 
 The overlay should update on every volume step, then return to the previous screen after a short timeout.
 Each additional volume adjustment refreshes the timeout, so the overlay remains visible for a few seconds after the user stops turning the knob.
+
+## Library Cache And Device History
+
+The player opens its locally cached library while the current library metadata and the signed-in user's progress are refreshed. This keeps menus responsive during normal navigation. `Continue Listening` is account progress; the setup page's recently played list is device history and records books played on this Chapter player. The local history is independent of Audiobookshelf account history.
 
 ## Suggested GPIO Pinout
 
@@ -195,6 +209,8 @@ USB-C VBUS -> 1.5 A fuse -> optional power switch -> Pi 5V / amp 5V
 USB-C GND  -> Pi GND / amp GND
 ```
 
+The switch in this drawing is a hard power disconnect, not a software shutdown control. Use the two-knob clean-shutdown gesture and wait for the Pi to power off before using a hard switch or unplugging the supply.
+
 Do not put the fuse in series with `GND`, `D+`, or `D-`.
 
 Adafruit specifies this breakout arrangement for 5 V at up to 1.5 A. Raspberry Pi recommends a 2 A-capable supply for the Zero 2 W, so the tested 5993 is the limiting part of this power path. If Chapter reports undervoltage, reboots at high volume, or behaves unreliably, replace the input path with a regulated 5 V solution rated for at least 2 A.
@@ -251,9 +267,11 @@ The page logs the player into Audiobookshelf with the selected user's username a
 
 This lets a parent change which Audiobookshelf user the appliance uses without attaching a keyboard and display to the Pi.
 
-To reveal the address without a monitor, hold the Volume knob for 10 seconds while the unit is powered on. The OLED should show the setup URL, such as `http://192.168.1.42`, for 5 seconds and then return to the previous screen.
+The setup page shows Wi-Fi, Audiobookshelf, Bluetooth, and current playback status. Its Remote Control tab searches and browses the library, starts or resumes books, controls playback and volume, skips chapters, manages Bluetooth audio, and displays recent playback stored on this device. That device history is independent of account-wide Audiobookshelf history.
 
-The web interface shows separate status rows for Wi-Fi, Audiobookshelf, Bluetooth, and current playback. Its System tab shows the installed version, available software updates, reboot control, and device-reset control. The `/health` route exposes machine-readable status for diagnostics.
+The Settings tab configures startup behavior, menu visibility and order, knob hold time, marquee delay and speed, navigation acceleration, browse-return delay, playback speed, library order, spoken navigation, screen saver, and sleep timer. The System tab shows the installed version, available upstream stable updates, reboot control, and device-reset control. The `/health` route exposes machine-readable status for diagnostics.
+
+The stable update checker follows the original upstream repository's release tags. Fork-specific commits on `main` are not distributed by that updater; see the fork's [SSH deployment guide](fork-development.md).
 
 ## Enclosure Notes
 

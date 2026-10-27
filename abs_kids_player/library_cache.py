@@ -48,6 +48,17 @@ def load_cached_books(config: AppConfig) -> list[Book]:
                     series_name=str(value.get("series_name", "")),
                     series_sequence=str(value.get("series_sequence", "")),
                     series_total=int(value.get("series_total", 0)),
+                    finished=bool(value.get("finished", False)),
+                    last_update=float(value.get("last_update", 0)),
+                    author_names=tuple(
+                        str(author).strip()
+                        for author in (
+                            value.get("author_names", [])
+                            if isinstance(value.get("author_names", []), (list, tuple))
+                            else []
+                        )
+                        if str(author).strip()
+                    ),
                 )
             )
         except (KeyError, TypeError, ValueError):
@@ -75,6 +86,9 @@ def save_cached_books(config: AppConfig, books: list[Book]) -> None:
                 "series_name": book.series_name,
                 "series_sequence": book.series_sequence,
                 "series_total": book.series_total,
+                "finished": book.finished,
+                "last_update": book.last_update,
+                "author_names": list(book.author_names),
             }
             for book in books
         ],
