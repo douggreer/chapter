@@ -14,7 +14,8 @@ CONFIG_PATH = CONFIG_DIR / "config.json"
 SCREEN_SAVER_CHAPTER = "chapter"
 SCREEN_SAVER_BOOKS = "books"
 SCREEN_SAVER_CLOCK = "clock"
-SCREEN_SAVER_MODES = (SCREEN_SAVER_CHAPTER, SCREEN_SAVER_BOOKS, SCREEN_SAVER_CLOCK)
+SCREEN_SAVER_OFF = "off"
+SCREEN_SAVER_MODES = (SCREEN_SAVER_CHAPTER, SCREEN_SAVER_BOOKS, SCREEN_SAVER_CLOCK, SCREEN_SAVER_OFF)
 LIBRARY_SORT_TITLE = "title"
 LIBRARY_SORT_AUTHOR = "author"
 LIBRARY_SORT_MODES = (LIBRARY_SORT_TITLE, LIBRARY_SORT_AUTHOR)
@@ -23,7 +24,7 @@ DEFAULT_ROOT_MENU_ORDER = ROOT_MENU_IDS
 DEFAULT_ROOT_MENU_ENABLED = ROOT_MENU_IDS
 NAV_ACCELERATION_MODES = ("off", *(f"{multiplier}x" for multiplier in range(2, 11)))
 DEFAULT_NAV_ACCELERATION_MODE = "10x"
-PLAYBACK_SPEEDS = (1.0, 1.5, 2.0)
+PLAYBACK_SPEEDS = (1.0, 1.25, 1.5, 2.0)
 DEFAULT_PLAYBACK_SPEED = 1.0
 DEFAULT_KNOB_HOLD_SECONDS = 1.0
 DEFAULT_MARQUEE_DELAY_SECONDS = 0.15
@@ -77,6 +78,7 @@ class AppConfig:
     root_menu_enabled: list[str] = field(default_factory=lambda: list(DEFAULT_ROOT_MENU_ENABLED))
     screen_saver_mode: str = SCREEN_SAVER_CHAPTER
     screen_saver_dim_percent: int = DEFAULT_SCREEN_SAVER_DIM_PERCENT
+    power_save_enabled: bool = False
     sleep_timer_enabled: bool = False
     sleep_timer_minutes: int = DEFAULT_SLEEP_TIMER_MINUTES
     podcasts: list[PodcastConfig] = field(default_factory=default_podcasts)
@@ -147,6 +149,7 @@ def load_config() -> AppConfig:
         root_menu_enabled=valid_root_menu_enabled(root_menu_enabled_value),
         screen_saver_mode=valid_screen_saver_mode(str(data.get("screen_saver_mode", ""))),
         screen_saver_dim_percent=valid_screen_saver_dim_percent(data.get("screen_saver_dim_percent")),
+        power_save_enabled=bool(data.get("power_save_enabled", False)),
         sleep_timer_enabled=bool(data.get("sleep_timer_enabled", False)),
         sleep_timer_minutes=valid_sleep_timer_minutes(data.get("sleep_timer_minutes")),
         podcasts=podcast_configs_from_json(data["podcasts"]) if "podcasts" in data else default_podcasts(),

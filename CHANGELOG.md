@@ -14,7 +14,7 @@ This fork's `main` branch is based on upstream Chapter v0.3.12. The following fe
 
 - Replaced the single alphabetical browsing list with a root menu for `Continue Listening`, `Browse by Series`, `Browse by Title`, `Browse by Author`, and `Bluetooth Settings`.
 - Added a Continue Listening list using the Audiobookshelf user's in-progress books, sorted by most recent progress activity and excluding finished books. Each item shows listening progress.
-- Added series and author group lists with book counts and nested book lists. Series browsing uses each book's primary series; series positions are shown only inside that series.
+- Added series and author group lists with book counts and nested book lists. Series browsing resolves each book to its first listed series using Audiobookshelf's canonical series groups; secondary series are ignored, and series positions are shown only inside that series.
 - Changed title browsing to show the plain audiobook title without a series prefix. Removed the large alphabet letter from the OLED and made long-title marquee timing and speed configurable.
 - Load and cache library metadata and user progress for navigation. Added a startup option to show a resume prompt for the user's most recently updated in-progress book; the default startup screen is the first root-menu item.
 
@@ -29,7 +29,9 @@ This fork's `main` branch is based on upstream Chapter v0.3.12. The following fe
 
 - Added remote library search and browsing by title, series, author, and in-progress books; the portal can start or resume books and control playback, volume, chapters, and Bluetooth audio.
 - Added recent playback history stored on the Chapter device, separate from Audiobookshelf account history, with a control to clear it.
-- Added portal controls for root-menu visibility and order, startup behavior, knob hold time, title marquee timing and speed, acceleration, browse-return timing, screen saver, playback speed, sleep timer, and other display/navigation preferences.
+- Added portal controls for root-menu visibility and order, startup behavior, knob hold time, title marquee timing and speed, acceleration, browse-return timing, screen saver including a display-off low-power mode, playback speed, sleep timer, and other display/navigation preferences.
+- Consolidated the Settings tab into one form and one save action, with consistent grouped controls. Added a minute-based shared idle timeout and a `1.25x` playback-speed option.
+- Added optional Power Save Mode with the existing adjustable idle timeout shared with the screen saver. When playback is stopped, it turns off the OLED, blocks Wi-Fi, stops the port-80 setup proxy, and mutes audio while leaving knob monitoring active; a knob turn restores the display and network services. The released amplifier wiring supports software mute but not physical amplifier power-off.
 - Added device-specific listening history and richer cached progress and author/series metadata. Continue Listening remains based on the Audiobookshelf account's progress, while the portal's recent list records playback performed on this device.
 - Added migration for the new settings so existing player configuration is retained when older separate knob-hold settings and earlier root menus are loaded.
 

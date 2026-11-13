@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import faulthandler
+import json
 import math
 import queue
 import signal
@@ -50,6 +51,7 @@ from .config import (
     SCREEN_SAVER_BOOKS,
     SCREEN_SAVER_CHAPTER,
     SCREEN_SAVER_CLOCK,
+    SCREEN_SAVER_OFF,
     AppConfig,
     load_config,
 )
@@ -98,7 +100,6 @@ DEFAULT_REFRESH_SECONDS = 0.14
 DEFAULT_STATUS_REFRESH_SECONDS = 2.0
 DEFAULT_SPLASH_SECONDS = 0.5
 DEFAULT_STARTUP_NETWORK_GRACE_SECONDS = 30.0
-DEFAULT_HOME_REFRESH_SECONDS = 60.0
 DEFAULT_TITLE_SCROLL_DELAY_SECONDS = 0.15
 DEFAULT_TITLE_SCROLL_PX_PER_SECOND = 48.0
 DEFAULT_TITLE_SCROLL_LOOP_PAUSE_SECONDS = 2.0
@@ -755,6 +756,25 @@ def request_clean_device_shutdown(
     return True
 
 
+def request_power_save_network_state(asleep: bool) -> bool:
+    state = "sleep" if asleep else "wake"
+    try:
+        request = Request(
+            "http://127.0.0.1:47831/internal/power-state",
+            data=state.encode("ascii"),
+            headers={"Content-Type": "text/plain; charset=utf-8"},
+            method="POST",
+        )
+        with urlopen(request, timeout=12.0) as response:
+            payload = json.loads(response.read(4096).decode("utf-8"))
+        if not payload.get("ok"):
+            raise OSError(payload.get("error", "Power state change was rejected."))
+        return True
+    except Exception as error:
+        print(f"Could not switch the setup portal/Wi-Fi power state to {state}: {error}")
+        return False
+
+
 def poll_playback_safely(playback: GStreamerPlayback) -> DisplayFrame | None:
     try:
         playback.poll()
@@ -977,7 +997,6 @@ def run_oled_service(
     status_refresh_seconds: float = DEFAULT_STATUS_REFRESH_SECONDS,
     splash_seconds: float = DEFAULT_SPLASH_SECONDS,
     startup_network_grace_seconds: float = DEFAULT_STARTUP_NETWORK_GRACE_SECONDS,
-    home_refresh_seconds: float = DEFAULT_HOME_REFRESH_SECONDS,
     nav_input_enabled: bool = True,
     nav_pins: Ky040Pins = Ky040Pins(clk=5, dt=6, sw=13, reversed=True),
     volume_input_enabled: bool = True,
@@ -1082,7 +1101,6 @@ def run_oled_service(
         cached_home_frame: DisplayFrame | None = None
         cached_status: WifiStatus | None = None
         home_frame_loaded_at = 0.0
-        last_home_load = 0.0
         book_refresh_started = False
         book_load_in_progress = False
         book_load_generation = 0
@@ -1107,8 +1125,17 @@ def run_oled_service(
         software_update_screen_visible = False
         sleep_timer = ListeningSleepTimer()
         display_brightness_percent = DEFAULT_ACTIVE_BRIGHTNESS_PERCENT
+        display_is_off = False
         screen_saver_visible = False
         wake_input_quiet_until = 0.0
+        power_save_active = False
+        power_save_network_asleep = False
+        power_save_restore_pending = True
+        power_save_retry_at = 0.0
+        if request_power_save_network_state(asleep=False):
+            power_save_restore_pending = False
+        else:
+            power_save_retry_at = time.monotonic() + 5.0
         paused_for_mute = False
         last_playback_volume_state: tuple[int, bool] | None = None
         last_playback_state_save = 0.0
@@ -1128,6 +1155,9 @@ def run_oled_service(
                     drain_input_events(events)
                     spoken_navigation.cancel()
                     screen_saver_visible = False
+                    if display_is_off:
+                        display.set_display_enabled(True)
+                        display_is_off = False
                     display_brightness_percent = update_display_brightness(
                         display,
                         DEFAULT_ACTIVE_BRIGHTNESS_PERCENT,
@@ -1186,6 +1216,24 @@ def run_oled_service(
                 if woke_screen_saver:
                     screen_saver_visible = False
                     last_input_at = now
+                    if power_save_active:
+                        power_save_active = False
+                        power_save_restore_pending = power_save_network_asleep
+                        power_save_retry_at = time.monotonic() + 5.0
+                        if display_is_off:
+                            display.set_display_enabled(True)
+                            display_is_off = False
+                        if request_power_save_network_state(asleep=False):
+                            power_save_network_asleep = False
+                            power_save_restore_pending = False
+                        else:
+                            power_save_restore_pending = True
+                            power_save_retry_at = time.monotonic() + 5.0
+                        try:
+                            playback.set_volume_state(software_volume, software_muted)
+                            set_amp_shutdown(amp_shutdown, software_muted, software_volume)
+                        except Exception as error:
+                            print(f"Audio restore after Power Save Mode failed: {error}")
                     if sleep_timer.wake():
                         menu.dismiss_sleep_confirmation()
                     display_brightness_percent = update_display_brightness(
@@ -1478,7 +1526,6 @@ def run_oled_service(
                     book_refresh_started = False
                     book_load_in_progress = False
                     books_error_frame = None
-                    last_home_load = 0.0
                     playback_loading = False
                 if runtime_config.spoken_navigation_enabled:
                     speech_output_device = playback.audio_output_device
@@ -1547,7 +1594,16 @@ def run_oled_service(
                 if sleep_timer.prompt_active:
                     menu.update_sleep_confirmation(sleep_timer.countdown_seconds(now))
 
-                if cached_status is None or now - last_status_load >= status_refresh_seconds:
+                if power_save_restore_pending and not power_save_active and now >= power_save_retry_at:
+                    if request_power_save_network_state(asleep=False):
+                        power_save_network_asleep = False
+                        power_save_restore_pending = False
+                    else:
+                        power_save_retry_at = time.monotonic() + 5.0
+
+                if not power_save_active and (
+                    cached_status is None or now - last_status_load >= status_refresh_seconds
+                ):
                     cached_status = wifi_status()
                     last_status_load = now
                 status = cached_status
@@ -1580,7 +1636,7 @@ def run_oled_service(
                     continue
                 overlay_frame = None
 
-                if status.connected and status.ssid != SETUP_HOTSPOT_SSID:
+                if status.connected and status.ssid != SETUP_HOTSPOT_SSID and not power_save_active:
                     if playback.session is not None and not playback_loading:
                         playback_error_frame = poll_playback_safely(playback)
                         if playback_error_frame is not None:
@@ -1622,11 +1678,7 @@ def run_oled_service(
                         if menu.tick_home_return_timeout(loop_elapsed):
                             cached_home_frame = None
                             home_frame_loaded_at = now
-                    if (
-                        not book_load_in_progress
-                        and (not book_refresh_started or now - last_home_load >= home_refresh_seconds)
-                    ):
-                        last_home_load = now
+                    if not book_load_in_progress and not book_refresh_started:
                         book_refresh_started = True
                         config = load_config()
                         if not config.is_ready:
@@ -1669,42 +1721,90 @@ def run_oled_service(
                     last_input_at,
                     runtime_config.screen_saver_idle_seconds,
                 ) and runtime_config.screen_saver_idle_seconds > 0 and not sleep_timer.prompt_active
+                power_save_idle = (
+                    runtime_config.power_save_enabled
+                    and runtime_config.screen_saver_idle_seconds > 0
+                    and screen_saver_is_active(
+                        now,
+                        last_input_at,
+                        runtime_config.screen_saver_idle_seconds,
+                    )
+                    and not playback.is_playing
+                    and not playback_loading
+                    and not sleep_timer.prompt_active
+                )
+                if power_save_idle and not power_save_active:
+                    if request_power_save_network_state(asleep=True):
+                        power_save_active = True
+                        power_save_network_asleep = True
+                        power_save_restore_pending = False
+                        try:
+                            playback.set_volume_state(0, True)
+                            set_amp_shutdown(amp_shutdown, True, software_volume)
+                        except Exception as error:
+                            print(f"Audio power down for Power Save Mode failed: {error}")
                 screen_saver_active = sleep_timer.sleeping or normal_screen_saver_active
                 if screen_saver_active:
                     screen_saver_mode = runtime_config.screen_saver_mode
-                    screen_saver_started_at = (
-                        sleep_timer.sleep_started_at
-                        if sleep_timer.sleeping
-                        else last_input_at
-                    )
-                    frame = screen_saver_frame(
-                        now,
-                        screen_saver_started_at,
-                        screen_saver_frames_per_second,
-                        mode=screen_saver_mode,
-                        words=screen_saver_words_for_mode(screen_saver_mode, menu.books),
-                        brightness_percent=runtime_config.screen_saver_dim_percent,
-                    )
-                display_brightness_percent = update_display_brightness(
-                    display,
-                    DEFAULT_ACTIVE_BRIGHTNESS_PERCENT,
-                    display_brightness_percent,
-                )
-                screen_saver_visible = screen_saver_active
-                publish_web_player_status(playback, software_volume, software_muted)
-                display.show(
-                    frame_with_status_indicators(
-                        frame,
-                        software_muted or software_volume <= 0,
-                        bluetooth_connected,
+                    if screen_saver_mode != SCREEN_SAVER_OFF and not power_save_active:
+                        screen_saver_started_at = (
+                            sleep_timer.sleep_started_at
+                            if sleep_timer.sleeping
+                            else last_input_at
+                        )
+                        frame = screen_saver_frame(
+                            now,
+                            screen_saver_started_at,
+                            screen_saver_frames_per_second,
+                            mode=screen_saver_mode,
+                            words=screen_saver_words_for_mode(screen_saver_mode, menu.books),
+                            brightness_percent=runtime_config.screen_saver_dim_percent,
+                        )
+                screen_saver_visible = screen_saver_active or power_save_active
+                if not power_save_active:
+                    publish_web_player_status(playback, software_volume, software_muted)
+                display_should_be_off = (
+                    power_save_active
+                    or (
+                        screen_saver_active
+                        and runtime_config.screen_saver_mode == SCREEN_SAVER_OFF
                     )
                 )
-                sleep_until_shutdown(shutdown, refresh_seconds)
+                if display_should_be_off:
+                    if not display_is_off:
+                        display.set_display_enabled(False)
+                        display_is_off = True
+                else:
+                    if display_is_off:
+                        display.set_display_enabled(True)
+                        display_is_off = False
+                    target_brightness = (
+                        runtime_config.screen_saver_dim_percent
+                        if screen_saver_active and not power_save_active
+                        else DEFAULT_ACTIVE_BRIGHTNESS_PERCENT
+                    )
+                    display_brightness_percent = update_display_brightness(
+                        display,
+                        target_brightness,
+                        display_brightness_percent,
+                    )
+                    display.show(
+                        frame_with_status_indicators(
+                            frame,
+                            software_muted or software_volume <= 0,
+                            bluetooth_connected,
+                        )
+                    )
+                idle_refresh_seconds = max(refresh_seconds, 0.5) if display_is_off else refresh_seconds
+                sleep_until_shutdown(shutdown, idle_refresh_seconds)
             except Exception:
                 print("OLED service loop error:")
                 traceback.print_exc()
                 try:
                     screen_saver_visible = False
+                    if display_is_off:
+                        display.set_display_enabled(True)
+                        display_is_off = False
                     display.show(TwoLineFrame("OLED error", "See log"))
                 except Exception:
                     print("OLED error frame could not be displayed:")
@@ -2177,7 +2277,6 @@ def main() -> None:
         type=float,
         default=DEFAULT_STARTUP_NETWORK_GRACE_SECONDS,
     )
-    parser.add_argument("--home-refresh-seconds", type=float, default=DEFAULT_HOME_REFRESH_SECONDS)
     parser.add_argument("--no-nav-input", action="store_true")
     parser.add_argument("--nav-clk-pin", type=int, default=5)
     parser.add_argument("--nav-dt-pin", type=int, default=6)
@@ -2221,7 +2320,6 @@ def main() -> None:
         status_refresh_seconds=args.status_refresh_seconds,
         splash_seconds=args.splash_seconds,
         startup_network_grace_seconds=args.startup_network_grace_seconds,
-        home_refresh_seconds=args.home_refresh_seconds,
         nav_input_enabled=not args.no_nav_input,
         nav_pins=Ky040Pins(
             clk=args.nav_clk_pin,

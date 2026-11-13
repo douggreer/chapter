@@ -33,12 +33,18 @@ class TextDisplay(Protocol):
     def set_brightness(self, percent: int) -> None:
         ...
 
+    def set_display_enabled(self, enabled: bool) -> None:
+        ...
+
 
 class ConsoleDisplay:
     def show(self, frame: DisplayFrame) -> None:
         print(f"{frame.top}\n{frame.bottom}\n")
 
     def set_brightness(self, percent: int) -> None:
+        pass
+
+    def set_display_enabled(self, enabled: bool) -> None:
         pass
 
 
@@ -77,6 +83,7 @@ class Sh1122Display:
         self.spi.max_speed_hz = max_speed_hz
         self.spi.mode = 0
         self.spi.no_cs = cs_pin is not None
+        self.display_enabled = False
         self.reset_display()
         self.init_display()
 
@@ -108,12 +115,20 @@ class Sh1122Display:
                 0xAF,  # display on
             ]
         )
+        self.display_enabled = True
         self.clear()
 
     def set_brightness(self, percent: int) -> None:
         percent = min(max(int(percent), 0), 100)
         contrast = round(self.default_contrast * ((percent / 100) ** self.brightness_gamma))
         self.command([0x81, contrast])
+
+    def set_display_enabled(self, enabled: bool) -> None:
+        enabled = bool(enabled)
+        if enabled == self.display_enabled:
+            return
+        self.command([0xAF if enabled else 0xAE])
+        self.display_enabled = enabled
 
     def command(self, values: list[int]) -> None:
         self.dc.off()
@@ -178,13 +193,7 @@ class Sh1122Display:
             self.draw_muted_icon(x=2)
         if bluetooth_connected:
             self.draw_bluetooth_icon(x=24 if muted else 2)
-        if isinstance(frame, ScreenSaverFrame):
-            self.apply_grayscale_brightness(frame.brightness_percent)
         self.flush()
-
-    def apply_grayscale_brightness(self, percent: int) -> None:
-        lookup = [scale_grayscale_value(value, percent) for value in range(256)]
-        self.image.paste(self.image.point(lookup))
 
     def draw_two_line(self, frame: TwoLineFrame) -> None:
         top_font = self.font_top
@@ -908,10 +917,6 @@ def oled_safe_text(text: str) -> str:
     return "".join(characters)
 
 
-def scale_grayscale_value(value: int, percent: int) -> int:
-    value = min(max(int(value), 0), 255)
-    percent = min(max(int(percent), 0), 100)
-    return round(value * (percent / 100))
 
 
 def pack_sh1122(image) -> bytearray:

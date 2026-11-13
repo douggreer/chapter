@@ -7,6 +7,7 @@ import math
 import re
 import threading
 import time
+from dataclasses import dataclass, field
 from typing import Any, Callable
 from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qsl, urlencode, urljoin, urlparse, urlunparse
@@ -35,6 +36,15 @@ TokenSaver = Callable[[str, str], None]
 
 class AudiobookshelfError(RuntimeError):
     pass
+
+
+@dataclass
+class LibrarySeries:
+    id: str
+    name: str
+    num_books: int = 0
+    book_ids: set[str] = field(default_factory=set)
+    book_sequences: dict[str, str] = field(default_factory=dict)
 
 
 class AudiobookshelfClient:
@@ -214,7 +224,7 @@ class AudiobookshelfClient:
         raise AudiobookshelfError("Audiobookshelf did not return current user details.")
 
     def get_books(self, library_id: str) -> list[Book]:
-        series_totals = self.get_series_totals(library_id)
+        series_catalog = self.get_series_catalog(library_id)
         data = self.request(
             "GET",
             f"/api/libraries/{library_id}/items",
@@ -262,10 +272,15 @@ class AudiobookshelfClient:
             author_names = author_names_from_metadata(metadata, author)
             cover_url = self.authenticated_media_url(f"/api/items/{item['id']}/cover")
             progress = progress_by_id.get(str(item["id"])) or extract_progress(item)
-            series_name, series_sequence = primary_series_from_metadata(metadata)
+            item_id = str(item["id"])
+            series_name, series_sequence, series_total = resolve_primary_series(
+                metadata,
+                item_id,
+                series_catalog,
+            )
             series_key = series_name.casefold()
             book = Book(
-                id=str(item["id"]),
+                id=item_id,
                 title=str(title),
                 author=str(author),
                 duration=float(media.get("duration") or 0),
@@ -274,6 +289,7 @@ class AudiobookshelfClient:
                 progress=float(progress.get("progress") or 0),
                 series_name=series_name,
                 series_sequence=series_sequence,
+                series_total=series_total,
                 finished=bool(progress.get("isFinished", False)),
                 last_update=float(
                     progress.get("lastUpdate")
@@ -296,38 +312,97 @@ class AudiobookshelfClient:
         for book, series_key in zip(books, series_keys):
             if not series_key:
                 continue
-            book.series_total = series_totals.get(
-                series_key,
-                max(
-                    fallback_counts.get(series_key, 0),
-                    fallback_highest_sequences.get(series_key, 0),
-                ),
+            book.series_total = max(
+                book.series_total,
+                fallback_counts.get(series_key, 0),
+                fallback_highest_sequences.get(series_key, 0),
             )
         return books
 
     def get_series_totals(self, library_id: str) -> dict[str, int]:
-        try:
-            data = self.request(
-                "GET",
-                f"/api/libraries/{library_id}/series",
-                query={"limit": 0},
-            )
-        except AudiobookshelfError:
-            return {}
+        return {
+            series.name.casefold(): series.num_books
+            for series in self.get_series_catalog(library_id)
+            if series.name and series.num_books > 0
+        }
 
-        rows = data.get("results", []) if isinstance(data, dict) else data
-        totals: dict[str, int] = {}
+    def get_series_catalog(self, library_id: str) -> list[LibrarySeries]:
+        page_size = 100
+        page = 0
+        rows: list[Any] = []
+        try:
+            while True:
+                data = self.request(
+                    "GET",
+                    f"/api/libraries/{library_id}/series",
+                    query={"limit": page_size, "page": page},
+                )
+                page_rows = data.get("results", []) if isinstance(data, dict) else data
+                if not isinstance(page_rows, list):
+                    break
+                rows.extend(page_rows)
+                if not isinstance(data, dict):
+                    break
+                try:
+                    total = int(data.get("total") or 0)
+                except (TypeError, ValueError):
+                    total = 0
+                if not page_rows or len(page_rows) < page_size or (total and len(rows) >= total):
+                    break
+                page += 1
+        except AudiobookshelfError as error:
+            print(f"Audiobookshelf series catalog could not be loaded: {error}")
+            return []
+
+        catalog: list[LibrarySeries] = []
         for series in rows or []:
             if not isinstance(series, dict):
                 continue
             name = str(series.get("name") or "").strip()
+            if not name:
+                continue
+            catalog_entry = LibrarySeries(
+                id=str(series.get("id") or "").strip(),
+                name=name,
+            )
+            library_item_ids = series.get("libraryItemIds") or []
+            if isinstance(library_item_ids, list):
+                catalog_entry.book_ids.update(
+                    str(item_id).strip()
+                    for item_id in library_item_ids
+                    if str(item_id).strip()
+                )
+            members = series.get("books") or series.get("items") or []
+            if isinstance(members, list):
+                for member in members:
+                    if not isinstance(member, dict):
+                        continue
+                    item = member.get("libraryItem") or member.get("item") or member
+                    if not isinstance(item, dict):
+                        continue
+                    item_id = str(
+                        item.get("id")
+                        or member.get("libraryItemId")
+                        or member.get("itemId")
+                        or ""
+                    ).strip()
+                    if not item_id:
+                        continue
+                    catalog_entry.book_ids.add(item_id)
+                    sequence = normalized_series_sequence(
+                        member.get("seriesSequence")
+                        or member.get("sequence")
+                        or item.get("seriesSequence")
+                    )
+                    if sequence:
+                        catalog_entry.book_sequences[item_id] = sequence
             try:
-                total = int(series.get("numBooks") or 0)
+                catalog_entry.num_books = int(series.get("numBooks") or 0)
             except (TypeError, ValueError):
-                total = 0
-            if name and total > 0:
-                totals[name.casefold()] = total
-        return totals
+                catalog_entry.num_books = 0
+            catalog_entry.num_books = max(catalog_entry.num_books, len(catalog_entry.book_ids))
+            catalog.append(catalog_entry)
+        return catalog
 
     def get_progress(self, item_id: str) -> dict[str, Any] | None:
         try:
@@ -456,27 +531,106 @@ def primary_series_from_metadata(metadata: dict[str, Any]) -> tuple[str, str]:
     if isinstance(raw_series, dict):
         raw_series = [raw_series]
 
-    first_series = ("", "")
     if isinstance(raw_series, list):
         for value in raw_series:
             if not isinstance(value, dict):
                 continue
             name = str(value.get("name") or value.get("series") or "").strip()
             if name:
-                sequence = normalized_series_sequence(value.get("sequence"))
-                if not first_series[0]:
-                    first_series = (name, sequence)
-                if sequence:
-                    return name, sequence
-
-    if first_series[0]:
-        return first_series
+                return name, normalized_series_sequence(value.get("sequence"))
 
     legacy = str(metadata.get("seriesName") or "").strip()
     match = re.match(r"^(.*?)\s+#\s*(\d+(?:\.\d+)?)\s*$", legacy)
     if match:
         return match.group(1).strip(), normalized_series_sequence(match.group(2))
     return (legacy, "") if legacy else ("", "")
+
+
+def resolve_primary_series(
+    metadata: dict[str, Any],
+    item_id: str,
+    catalog: list[LibrarySeries],
+) -> tuple[str, str, int]:
+    """Resolve one book to its first listed series and the server's canonical name."""
+    memberships = [series for series in catalog if item_id in series.book_ids]
+    raw_series = metadata.get("series") or []
+    if isinstance(raw_series, dict):
+        raw_series = [raw_series]
+
+    primary: dict[str, Any] | None = None
+    if isinstance(raw_series, list):
+        primary = next(
+            (
+                value
+                for value in raw_series
+                if isinstance(value, dict)
+                and (
+                    str(value.get("id") or value.get("seriesId") or "").strip()
+                    or str(value.get("name") or value.get("series") or "").strip()
+                )
+            ),
+            None,
+        )
+
+    if primary is not None:
+        series_id = str(primary.get("id") or primary.get("seriesId") or "").strip()
+        series_name = str(primary.get("name") or primary.get("series") or "").strip()
+        matched = next(
+            (series for series in catalog if series_id and series.id == series_id),
+            None,
+        )
+        parsed_sequence = ""
+        if matched is None and series_name:
+            matched, parsed_sequence = match_canonical_series_label(
+                series_name,
+                memberships or catalog,
+            )
+        sequence = normalized_series_sequence(primary.get("sequence")) or parsed_sequence
+        if matched is not None:
+            sequence = sequence or matched.book_sequences.get(item_id, "")
+            return matched.name, sequence, matched.num_books
+        if series_name:
+            name, legacy_sequence = strip_legacy_series_number(series_name)
+            return name, sequence or legacy_sequence, 0
+
+    legacy = str(metadata.get("seriesName") or "").strip()
+    if legacy:
+        matched, sequence = match_canonical_series_label(legacy, memberships or catalog)
+        if matched is not None:
+            sequence = sequence or matched.book_sequences.get(item_id, "")
+            return matched.name, sequence, matched.num_books
+        name, sequence = strip_legacy_series_number(legacy)
+        return name, sequence, 0
+
+    if memberships:
+        first = memberships[0]
+        return first.name, first.book_sequences.get(item_id, ""), first.num_books
+    return "", "", 0
+
+
+def match_canonical_series_label(
+    label: str,
+    candidates: list[LibrarySeries],
+) -> tuple[LibrarySeries | None, str]:
+    """Match a legacy/composite label to its leading canonical series name."""
+    clean = label.strip()
+    for series in sorted(candidates, key=lambda value: len(value.name), reverse=True):
+        match = re.match(
+            rf"^{re.escape(series.name)}(?:\s*#\s*(\d+(?:\.\d+)?))?(?:\s*,.*)?$",
+            clean,
+            flags=re.IGNORECASE,
+        )
+        if match:
+            return series, normalized_series_sequence(match.group(1))
+    return None, ""
+
+
+def strip_legacy_series_number(label: str) -> tuple[str, str]:
+    clean = label.strip()
+    match = re.match(r"^(.*?)\s+#\s*(\d+(?:\.\d+)?)\s*$", clean)
+    if match:
+        return match.group(1).strip(), normalized_series_sequence(match.group(2))
+    return clean, ""
 
 
 def normalized_series_sequence(value: Any) -> str:

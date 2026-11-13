@@ -248,7 +248,7 @@ If no library is selected, the player uses the user's default audiobook library 
 - Click the Volume knob to play or pause and return to the playback screen.
 - Hold the Volume knob for the configured duration to return to the root menu.
 - Hold both knobs together for the configured duration to cleanly shut down the Pi. The gesture works from every screen, whether or not its root-menu instruction is visible. Wait for poweroff before disconnecting power.
-- The Settings tab lets you reorder and hide root-menu items and adjust knob hold time, marquee timing and speed, acceleration, the return-to-playback delay, startup behavior, screen saver, and other player preferences.
+- The Settings tab groups player preferences into one form with one save action. It lets you reorder and hide root-menu items and adjust knob hold time, marquee timing and speed, acceleration, the return-to-playback delay, startup behavior, screen saver, and the shared screen-saver/Power Save Mode timeout in minutes. Optional Power Save Mode switches off the OLED and Wi-Fi, stops the port-80 setup proxy, and mutes audio while the player continues monitoring the knobs; turning either knob wakes it. With the released amplifier wiring, audio is muted but amplifier power is not cut.
 - The Remote Control tab can search and browse the library, start books, control playback and volume, skip chapters, manage Bluetooth audio, and show recent books played on this device.
 - When spoken navigation is enabled, Volume-knob changes are announced at 10% intervals, volume stops at 10%, and pressing the Volume knob does not mute the player.
 

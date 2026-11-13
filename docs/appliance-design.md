@@ -150,6 +150,12 @@ Each additional volume adjustment refreshes the timeout, so the overlay remains 
 
 The player opens its locally cached library while the current library metadata and the signed-in user's progress are refreshed. This keeps menus responsive during normal navigation. `Continue Listening` is account progress; the setup page's recently played list is device history and records books played on this Chapter player. The local history is independent of Audiobookshelf account history.
 
+The portal's Settings tab has one idle timeout, entered in minutes and shared by the screen saver and optional Power Save Mode. The timeout is adjustable from 0 to 60 minutes; 0 disables both. The screen-saver style can turn the OLED panel off after that timeout while leaving playback, Wi-Fi, and the portal available.
+
+Power Save Mode is off by default. When enabled, and no book is playing when the shared timeout expires, it mutes audio, switches off the SH1122 display controller, stops the port-80 setup proxy, and blocks Wi-Fi. The OLED process and knob inputs stay active; turning either knob restores Wi-Fi, the portal proxy, the display, and audio. The root setup service remains available on loopback as the wake coordinator and rejects remote portal requests while power save is active. This is software idle mode, not Raspberry Pi suspend: the Pi's CPU and GPIO monitoring remain powered.
+
+The released hardware leaves the MAX98357A amplifier's `SD` pad disconnected. Power Save Mode therefore mutes audio in software, but cannot remove power from the amplifier on this wiring. Physical amplifier shutdown requires connecting its `SD` control to a GPIO and configuring the existing amplifier-shutdown option. Animated screen savers use the configured OLED brightness level.
+
 ## Suggested GPIO Pinout
 
 This pinout avoids the I2S pins used by the MAX98357A amplifier. `GPIO` values use BCM numbering; `Physical Pin` values identify positions on the 40-pin header.
@@ -269,7 +275,7 @@ This lets a parent change which Audiobookshelf user the appliance uses without a
 
 The setup page shows Wi-Fi, Audiobookshelf, Bluetooth, and current playback status. Its Remote Control tab searches and browses the library, starts or resumes books, controls playback and volume, skips chapters, manages Bluetooth audio, and displays recent playback stored on this device. That device history is independent of account-wide Audiobookshelf history.
 
-The Settings tab configures startup behavior, menu visibility and order, knob hold time, marquee delay and speed, navigation acceleration, browse-return delay, playback speed, library order, spoken navigation, screen saver, and sleep timer. The System tab shows the installed version, available upstream stable updates, reboot control, and device-reset control. The `/health` route exposes machine-readable status for diagnostics.
+The Settings tab configures startup behavior, menu visibility and order, knob hold time, marquee delay and speed, navigation acceleration, browse-return delay, playback speed, library order, spoken navigation, screen saver and its shared Power Save Mode timeout, and sleep timer. The System tab shows the installed version, available upstream stable updates, reboot control, and device-reset control. The `/health` route exposes machine-readable status for diagnostics.
 
 The stable update checker follows the original upstream repository's release tags. Fork-specific commits on `main` are not distributed by that updater; see the fork's [SSH deployment guide](fork-development.md).
 

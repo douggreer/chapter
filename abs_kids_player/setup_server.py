@@ -6,6 +6,7 @@ import html
 import ipaddress
 import json
 import secrets
+import shutil
 import subprocess
 import threading
 import time
@@ -30,6 +31,7 @@ from .config import (
     SCREEN_SAVER_BOOKS,
     SCREEN_SAVER_CHAPTER,
     SCREEN_SAVER_CLOCK,
+    SCREEN_SAVER_OFF,
     SCREEN_SAVER_DIM_LEVELS,
     AppConfig,
     PodcastConfig,
@@ -51,7 +53,7 @@ from .config import (
     valid_screen_saver_mode,
     valid_sleep_timer_minutes,
 )
-from .library_cache import clear_cached_books, load_cached_books
+from .library_cache import clear_cached_books, library_cache_path, load_cached_books
 from .device_history import clear_device_playback_history, load_device_playback_history
 from .player_state import clear_last_playback
 from .player_control import (
@@ -92,6 +94,9 @@ PLAYER_EVENT_HEARTBEAT_SECONDS = 10.0
 MAX_POST_BODY_BYTES = 64 * 1024
 CSRF_FIELD_NAME = "csrf_token"
 LOGO_PATH = Path(__file__).resolve().parent / "assets" / "chapter-logo.png"
+PORT80_PROXY_SERVICE = "audiobookshelf-player-port80-forward.service"
+_POWER_SAVE_STATE_LOCK = threading.Lock()
+_POWER_SAVE_NETWORK_ASLEEP = False
 
 
 PAGE = """<!doctype html>
@@ -105,6 +110,8 @@ PAGE = """<!doctype html>
   <style>
     body {{
       font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      font-size: 15px;
+      line-height: 1.5;
       margin: 0;
       min-height: 100vh;
       background: #edf1ef;
@@ -298,26 +305,88 @@ PAGE = """<!doctype html>
     .hint {{
       font-size: 0.92rem;
     }}
-    .settings-list {{
-      margin-top: 12px;
+    .settings-form {{ margin: 0; }}
+    .settings-section {{
+      margin-top: 16px;
+      padding: 18px;
       border: 1px solid #dfe6e3;
-      border-radius: 8px;
-      overflow: hidden;
+      border-radius: 9px;
+      background: #fbfcfb;
     }}
-    .navigation-settings-card {{
-      margin-top: 18px;
-      padding: 16px;
-      border: 1px solid #dfe6e3;
-      border-radius: 8px;
-      background: #f8faf9;
+    .settings-section:first-of-type {{ margin-top: 0; }}
+    .settings-section h3 {{ margin: 0 0 14px; font-size: 1.02rem; line-height: 1.3; }}
+    .settings-section .section-hint {{ margin: -7px 0 14px; font-size: 0.9rem; }}
+    .settings-grid {{
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 14px 18px;
+      align-items: start;
     }}
-    .navigation-settings-card h3 {{ margin: 0; font-size: 1rem; }}
-    .navigation-settings-card .hint {{ margin: 5px 0 14px; }}
-    .navigation-settings-form {{ margin: 0; }}
+    .settings-field {{ min-width: 0; margin: 0; color: #4e5b5e; font-size: 0.9rem; font-weight: 650; }}
+    .settings-field .settings-number,
+    .settings-field .settings-select {{
+      display: block;
+      box-sizing: border-box;
+      width: 100%;
+      min-width: 0;
+      min-height: 42px;
+      margin-top: 5px;
+      padding: 8px 10px;
+      border: 1px solid #cbd5d2;
+      border-radius: 7px;
+      background: #fff;
+      color: #202a2c;
+      font: inherit;
+    }}
+    .settings-field .hint {{ display: block; margin: 5px 0 0; font-size: 0.82rem; font-weight: 400; }}
+    .setting-option-row {{
+      display: flex;
+      min-width: 0;
+      min-height: 44px;
+      align-items: center;
+      justify-content: space-between;
+      gap: 14px;
+      padding: 10px 12px;
+      border: 1px solid #e1e8e5;
+      border-radius: 8px;
+      background: #fff;
+    }}
+    .setting-option-wide {{ grid-column: 1 / -1; }}
+    .setting-option-copy {{ min-width: 0; }}
+    .setting-option-name {{ color: #263234; font-weight: 700; line-height: 1.3; }}
+    .setting-option-copy .hint {{ display: block; margin: 4px 0 0; font-size: 0.82rem; }}
+    .setting-switch {{ position: relative; display: inline-flex; flex: 0 0 auto; margin: 0; cursor: pointer; }}
+    .setting-switch input {{ position: absolute; width: 1px; height: 1px; min-height: 1px; margin: 0; opacity: 0; }}
+    .setting-switch span {{
+      position: relative;
+      display: block;
+      width: 50px;
+      height: 29px;
+      border-radius: 999px;
+      background: #a9b2af;
+      transition: background 120ms ease;
+    }}
+    .setting-switch span::after {{
+      content: "";
+      position: absolute;
+      top: 3px;
+      left: 3px;
+      width: 23px;
+      height: 23px;
+      border-radius: 50%;
+      background: #fff;
+      box-shadow: 0 1px 3px rgba(0, 0, 0, 0.22);
+      transition: transform 120ms ease;
+    }}
+    .setting-switch input:checked + span {{ background: #2e7d79; }}
+    .setting-switch input:checked + span::after {{ transform: translateX(21px); }}
+    .setting-switch input:focus-visible + span {{ outline: 3px solid #e8ad55; outline-offset: 3px; }}
+    .settings-save-row {{ display: flex; justify-content: flex-end; margin-top: 18px; }}
+    .settings-save-row button {{ width: auto; min-width: 160px; margin: 0; padding: 9px 18px; }}
     .nav-settings-grid {{ display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px 14px; }}
-    .nav-settings-grid label {{ margin: 0; color: #59616d; font-size: 0.84rem; }}
+    .nav-settings-grid label {{ margin: 0; color: #4e5b5e; font-size: 0.88rem; font-weight: 650; }}
     .nav-settings-grid .settings-number, .nav-settings-grid .settings-select {{
-      display: block; box-sizing: border-box; width: 100%; min-height: 38px; margin-top: 4px;
+      display: block; box-sizing: border-box; width: 100%; min-height: 42px; margin-top: 5px;
     }}
     .root-menu-settings {{ min-width: 0; margin: 16px 0 0; padding: 10px 12px; border: 1px solid #dfe6e3; border-radius: 8px; }}
     .root-menu-settings legend {{ padding: 0 5px; font-weight: 800; }}
@@ -327,65 +396,9 @@ PAGE = """<!doctype html>
     .root-menu-enabled input {{ width: 18px; min-height: 18px; margin: 0; }}
     .root-menu-position {{ margin: 0; color: #59616d; font-size: 0.8rem; }}
     .root-menu-position .settings-select {{ width: 100%; min-width: 0; margin-top: 3px; }}
-    .navigation-settings-form > button {{ margin-top: 12px; }}
-    .settings-row {{
-      display: grid;
-      grid-template-columns: 1fr auto;
-      gap: 16px;
-      align-items: center;
-      padding: 12px;
-      border-top: 1px solid #dfe6e3;
-    }}
-    .settings-row:first-child {{ border-top: 0; }}
-    .setting-name {{
-      font-weight: 800;
-    }}
-    .setting-state {{
-      color: #59616d;
-      font-size: 0.88rem;
-      margin-top: 3px;
-    }}
-    .toggle-form {{
-      margin: 0;
-    }}
-    .toggle-button {{
-      position: relative;
-      width: 54px;
-      height: 30px;
-      min-height: 30px;
-      margin: 0;
-      padding: 0;
-      display: block;
-      box-sizing: border-box;
-      border-radius: 999px;
-      background: #a9aea9;
-      overflow: hidden;
-    }}
-    .toggle-button::after {{
-      content: "";
-      position: absolute;
-      top: 4px;
-      left: 4px;
-      width: 22px;
-      height: 22px;
-      border-radius: 50%;
-      background: #fff;
-      box-shadow: 0 1px 3px rgba(0, 0, 0, 0.28);
-    }}
-    .toggle-button.is-on {{
-      background: #2e7d79;
-    }}
-    .toggle-button.is-on::after {{
-      left: 28px;
-    }}
-    .select-form {{
-      display: flex;
-      gap: 8px;
-      align-items: center;
-      margin: 0;
-    }}
     .settings-select {{
       min-width: 150px;
+      min-height: 42px;
       border: 1px solid #d8d0c5;
       border-radius: 8px;
       padding: 8px 10px;
@@ -393,44 +406,11 @@ PAGE = """<!doctype html>
       color: #1f2933;
       font: inherit;
     }}
-    .screen-saver-settings-form {{
-      grid-column: 1 / -1;
-      display: grid;
-      grid-template-columns: minmax(0, 1fr) minmax(0, 0.8fr) auto;
-      gap: 8px;
-      align-items: end;
-      margin: 2px 0 0;
-    }}
-    .screen-saver-settings-form label {{
-      margin: 0;
-      color: #59616d;
-      font-size: 0.82rem;
-    }}
-    .screen-saver-settings-form .settings-select {{
-      width: 100%;
-      min-width: 0;
-      margin-top: 4px;
-    }}
     .settings-number {{
       width: 76px;
       min-height: 38px;
       margin: 0;
       padding: 7px 8px;
-    }}
-    .sleep-timer-content {{
-      min-width: 0;
-    }}
-    .sleep-timer-duration-form {{
-      display: flex;
-      flex-wrap: wrap;
-      gap: 8px;
-      align-items: center;
-      margin: 10px 0 0;
-      color: #59616d;
-      font-size: 0.88rem;
-    }}
-    .sleep-timer-duration-form .settings-number {{
-      width: 68px;
     }}
     .small-button {{
       width: auto;
@@ -678,10 +658,9 @@ PAGE = """<!doctype html>
       .status-row:first-child {{
         border-top: 0;
       }}
-      .screen-saver-settings-form {{
-        grid-template-columns: 1fr;
-      }}
-      .nav-settings-grid {{ grid-template-columns: 1fr; }}
+      .settings-grid, .nav-settings-grid {{ grid-template-columns: 1fr; }}
+      .setting-option-wide {{ grid-column: auto; }}
+      .settings-save-row button {{ width: 100%; }}
       .remote-book, .remote-group, .remote-recent-item {{ grid-template-columns: 1fr; }}
       .remote-book-actions {{ display: grid; grid-template-columns: 1fr 1fr; }}
       .podcast-row {{
@@ -1300,15 +1279,45 @@ PAGE = """<!doctype html>
       if (!books.length) {{ appendEmpty(container, "No matching books found."); return; }}
       books.forEach(function(book) {{ addRemoteBook(container, book, false); }});
     }}
-    function refreshRemoteLibrary() {{
+    var remoteLibraryCacheVersion = "";
+    function refreshRemoteLibrary(callback) {{
       getJson("/library/books", function(data, error) {{
         if (error || !data || !Array.isArray(data.books)) {{
           var container = document.querySelector("[data-library-results]");
           if (container) {{ container.textContent = ""; appendEmpty(container, "Could not load the cached library. Refresh the library or check the connection.", true); }}
+          if (callback) {{ callback(null, error || new Error("Invalid library response")); }}
           return;
         }}
         remoteBooks = data.books;
+        remoteLibraryCacheVersion = String(data.cacheUpdatedAt || "");
         renderRemoteLibrary();
+        if (callback) {{ callback(data, null); }}
+      }});
+    }}
+    function finishLibraryRefresh(message) {{
+      if (libraryRefreshButton) {{
+        libraryRefreshButton.disabled = false;
+        libraryRefreshButton.textContent = "Refresh library";
+      }}
+      var refreshStatus = document.querySelector("[data-library-refresh-status]");
+      if (refreshStatus) {{ refreshStatus.textContent = message; }}
+    }}
+    function waitForLibraryRefresh(previousVersion, attemptsRemaining) {{
+      getJson("/library/books", function(data, error) {{
+        if (!error && data && Array.isArray(data.books)) {{
+          remoteBooks = data.books;
+          remoteLibraryCacheVersion = String(data.cacheUpdatedAt || "");
+          renderRemoteLibrary();
+          if (remoteLibraryCacheVersion && remoteLibraryCacheVersion !== previousVersion) {{
+            finishLibraryRefresh("Library refreshed from Audiobookshelf.");
+            return;
+          }}
+        }}
+        if (attemptsRemaining <= 0) {{
+          finishLibraryRefresh("Refresh is taking longer than expected. Showing the last cached library; check the Audiobookshelf connection if it does not update.");
+          return;
+        }}
+        window.setTimeout(function() {{ waitForLibraryRefresh(previousVersion, attemptsRemaining - 1); }}, 1000);
       }});
     }}
     function refreshRecentPlayback() {{
@@ -1404,8 +1413,18 @@ PAGE = """<!doctype html>
     var libraryRefreshButton = document.querySelector("[data-library-refresh]");
     if (libraryRefreshButton) {{ libraryRefreshButton.addEventListener("click", function() {{
       libraryRefreshButton.disabled = true;
-      postPlayer({{action: "refresh_books"}}, function() {{
-        window.setTimeout(function() {{ refreshRemoteLibrary(); libraryRefreshButton.disabled = false; }}, 1500);
+      libraryRefreshButton.textContent = "Refreshing…";
+      var refreshStatus = document.querySelector("[data-library-refresh-status]");
+      if (refreshStatus) {{ refreshStatus.textContent = "Requesting the latest library and series data from Audiobookshelf…"; }}
+      refreshRemoteLibrary(function(previousData) {{
+        var previousVersion = previousData ? String(previousData.cacheUpdatedAt || "") : remoteLibraryCacheVersion;
+        postPlayer({{action: "refresh_books"}}, function(status) {{
+          if (status < 200 || status >= 300) {{
+            finishLibraryRefresh("Could not start the library refresh. Please try again.");
+            return;
+          }}
+          waitForLibraryRefresh(previousVersion, 45);
+        }});
       }});
     }}); }}
     document.querySelectorAll("[data-player-command]").forEach(function(button) {{
@@ -1570,11 +1589,57 @@ HEALTH_PAGE = """<!doctype html>
 """
 
 
+def power_save_network_asleep() -> bool:
+    with _POWER_SAVE_STATE_LOCK:
+        return _POWER_SAVE_NETWORK_ASLEEP
+
+
+def run_power_save_system_command(command: list[str]) -> None:
+    try:
+        result = subprocess.run(command, capture_output=True, text=True, timeout=5, check=False)
+    except (OSError, subprocess.TimeoutExpired) as error:
+        raise RuntimeError(f"Could not run {command[0]}: {error}") from error
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout).strip()
+        raise RuntimeError(detail or f"{command[0]} exited with status {result.returncode}")
+
+
+def set_power_save_network_state(asleep: bool) -> None:
+    global _POWER_SAVE_NETWORK_ASLEEP
+    with _POWER_SAVE_STATE_LOCK:
+        rfkill = shutil.which("rfkill")
+        if asleep:
+            if _POWER_SAVE_NETWORK_ASLEEP:
+                return
+            try:
+                run_power_save_system_command(["systemctl", "stop", PORT80_PROXY_SERVICE])
+                if not rfkill:
+                    raise RuntimeError("rfkill is not installed; Wi-Fi cannot be disabled.")
+                run_power_save_system_command([rfkill, "block", "wlan"])
+            except RuntimeError:
+                try:
+                    run_power_save_system_command(["systemctl", "start", PORT80_PROXY_SERVICE])
+                except RuntimeError as rollback_error:
+                    print(f"Power save rollback could not start the setup portal proxy: {rollback_error}")
+                raise
+            _POWER_SAVE_NETWORK_ASLEEP = True
+            return
+
+        if not rfkill:
+            raise RuntimeError("rfkill is not installed; Wi-Fi cannot be restored.")
+        run_power_save_system_command([rfkill, "unblock", "wlan"])
+        _POWER_SAVE_NETWORK_ASLEEP = False
+        run_power_save_system_command(["systemctl", "start", PORT80_PROXY_SERVICE])
+
+
 class SetupHandler(BaseHTTPRequestHandler):
     server_version = f"ChapterPlayer/{__version__}"
     protocol_version = "HTTP/1.1"
 
     def do_GET(self) -> None:
+        if power_save_network_asleep() and not self.is_loopback_client():
+            self.send_request_error(503, "Chapter Player is in Power Save Mode. Turn a knob to wake it.")
+            return
         path = urlparse(self.path).path
         if path == "/assets/chapter-logo.png":
             self.send_logo_png()
@@ -1630,6 +1695,17 @@ class SetupHandler(BaseHTTPRequestHandler):
             schedule_system_shutdown()
             return
 
+        if path == "/internal/power-state":
+            if not self.is_loopback_client():
+                self.send_error(403, "Power state is available only to local device services.")
+                return
+            self.handle_internal_power_state_post()
+            return
+
+        if power_save_network_asleep() and not self.is_loopback_client():
+            self.send_request_error(503, "Chapter Player is in Power Save Mode. Turn a knob to wake it.")
+            return
+
         handlers = {
             "/wifi": self.handle_wifi_post,
             "/wifi/forget": self.handle_forget_wifi_post,
@@ -1638,6 +1714,7 @@ class SetupHandler(BaseHTTPRequestHandler):
             "/settings/spoken-navigation": self.handle_spoken_navigation_setting_post,
             "/settings/library-order": self.handle_library_sort_setting_post,
             "/settings/navigation": self.handle_navigation_settings_post,
+            "/settings": self.handle_settings_post,
             "/settings/playback-speed": self.handle_playback_speed_setting_post,
             "/settings/screensaver": self.handle_screen_saver_setting_post,
             "/settings/sleep": self.handle_sleep_setting_post,
@@ -1660,6 +1737,33 @@ class SetupHandler(BaseHTTPRequestHandler):
             self.send_csrf_error()
             return
         handler()
+
+    def is_loopback_client(self) -> bool:
+        try:
+            return ipaddress.ip_address(self.client_address[0]).is_loopback
+        except (TypeError, ValueError):
+            return False
+
+    def handle_internal_power_state_post(self) -> None:
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+        except (TypeError, ValueError):
+            self.send_json({"ok": False, "error": "Invalid request length."})
+            return
+        if length < 1 or length > 8:
+            self.send_json({"ok": False, "error": "Invalid power state request."})
+            return
+        state = self.rfile.read(length).decode("ascii", errors="ignore").strip().lower()
+        if state not in {"sleep", "wake"}:
+            self.send_json({"ok": False, "error": "Expected sleep or wake."})
+            return
+        try:
+            set_power_save_network_state(asleep=state == "sleep")
+        except RuntimeError as error:
+            print(f"Power save network transition failed: {error}")
+            self.send_json({"ok": False, "error": str(error)})
+            return
+        self.send_json({"ok": True, "state": state})
 
     def csrf_token(self) -> str:
         return getattr(getattr(self, "server", None), "csrf_token", "")
@@ -1831,6 +1935,13 @@ class SetupHandler(BaseHTTPRequestHandler):
         save_navigation_settings(fields)
         self.redirect_home()
 
+    def handle_settings_post(self) -> None:
+        fields = self.post_fields()
+        if fields is None:
+            return
+        save_all_settings(fields)
+        self.redirect_home()
+
     def handle_library_sort_setting_post(self) -> None:
         fields = self.post_fields()
         if fields is None:
@@ -1850,13 +1961,22 @@ class SetupHandler(BaseHTTPRequestHandler):
         if fields is None:
             return
         mode = valid_screen_saver_mode(one(fields, "screen_saver_mode"))
-        if "screen_saver_dim_percent" in fields:
-            save_screen_saver_setting(
-                mode,
-                valid_screen_saver_dim_percent(one(fields, "screen_saver_dim_percent")),
-            )
-        else:
-            save_screen_saver_setting(mode)
+        dim_percent = (
+            valid_screen_saver_dim_percent(one(fields, "screen_saver_dim_percent"))
+            if "screen_saver_dim_percent" in fields
+            else None
+        )
+        idle_seconds = (
+            valid_screen_saver_idle_seconds(one(fields, "screen_saver_idle_seconds"))
+            if "screen_saver_idle_seconds" in fields
+            else None
+        )
+        save_screen_saver_setting(
+            mode,
+            dim_percent,
+            power_save_enabled=one(fields, "power_save_enabled").lower() in {"1", "true", "on", "yes"},
+            idle_seconds=idle_seconds,
+        )
         self.redirect_home()
 
     def handle_sleep_setting_post(self) -> None:
@@ -2064,7 +2184,11 @@ class SetupHandler(BaseHTTPRequestHandler):
                     "lastUpdate": last_update,
                 }
             )
-        self.send_json({"books": payload, "count": len(payload)})
+        try:
+            cache_updated_at = str(library_cache_path().stat().st_mtime_ns)
+        except OSError:
+            cache_updated_at = ""
+        self.send_json({"books": payload, "count": len(payload), "cacheUpdatedAt": cache_updated_at})
 
     def send_system_update_status_json(self) -> None:
         self.send_json(update_status_payload())
@@ -2303,6 +2427,62 @@ def save_spoken_navigation_setting(enabled: bool) -> AppConfig:
     return updated
 
 
+def save_all_settings(fields: dict[str, list[str]]) -> AppConfig:
+    config = load_config()
+    order_with_positions = []
+    for fallback_position, menu_id in enumerate(DEFAULT_ROOT_MENU_ORDER):
+        try:
+            position = int(one(fields, f"menu_order_{menu_id}"))
+        except ValueError:
+            position = fallback_position
+        order_with_positions.append((max(0, min(20, position)), fallback_position, menu_id))
+    order = valid_root_menu_order(
+        [menu_id for _position, _fallback, menu_id in sorted(order_with_positions)]
+    )
+    enabled = valid_root_menu_enabled(fields.get("menu_enabled", []))
+
+    try:
+        idle_minutes = float(one(fields, "screen_saver_idle_minutes"))
+        idle_seconds = valid_screen_saver_idle_seconds(idle_minutes * 60.0)
+    except ValueError:
+        idle_seconds = config.screen_saver_idle_seconds
+
+    updated = replace(
+        config,
+        control_click_enabled=one(fields, "control_click_enabled").lower() in {"1", "true", "on", "yes"},
+        spoken_navigation_enabled=one(fields, "spoken_navigation_enabled").lower() in {"1", "true", "on", "yes"},
+        library_sort_mode=valid_library_sort_mode(one(fields, "library_sort_mode")),
+        playback_speed=valid_playback_speed(one(fields, "playback_speed")),
+        knob_hold_seconds=valid_long_press_seconds(one(fields, "knob_hold_seconds"), config.knob_hold_seconds),
+        marquee_delay_seconds=valid_marquee_delay(one(fields, "marquee_delay_seconds")),
+        marquee_speed_px_per_second=valid_marquee_speed(one(fields, "marquee_speed_px_per_second")),
+        marquee_loop_pause_seconds=valid_marquee_loop_pause(one(fields, "marquee_loop_pause_seconds")),
+        navigation_acceleration_mode=valid_navigation_acceleration_mode(
+            one(fields, "navigation_acceleration_mode")
+        ),
+        navigation_accel_threshold_milliseconds=valid_acceleration_milliseconds(
+            one(fields, "navigation_accel_threshold_milliseconds"),
+            config.navigation_accel_threshold_milliseconds,
+        ),
+        startup_resume_last_played=(
+            one(fields, "startup_resume_last_played").lower() in {"1", "true", "on", "yes"}
+        ),
+        browse_return_seconds=valid_browse_return_seconds(one(fields, "browse_return_seconds")),
+        screen_saver_idle_seconds=idle_seconds,
+        root_menu_order=order,
+        root_menu_enabled=enabled,
+        screen_saver_mode=valid_screen_saver_mode(one(fields, "screen_saver_mode")),
+        screen_saver_dim_percent=valid_screen_saver_dim_percent(one(fields, "screen_saver_dim_percent")),
+        power_save_enabled=one(fields, "power_save_enabled").lower() in {"1", "true", "on", "yes"},
+        sleep_timer_enabled=one(fields, "sleep_timer_enabled").lower() in {"1", "true", "on", "yes"},
+        sleep_timer_minutes=valid_sleep_timer_minutes(one(fields, "sleep_timer_minutes")),
+    )
+    save_config(updated)
+    if updated.library_sort_mode != config.library_sort_mode:
+        queue_web_player_command("resort_library")
+    return updated
+
+
 def save_navigation_settings(fields: dict[str, list[str]]) -> AppConfig:
     config = load_config()
     order_with_positions = []
@@ -2351,11 +2531,6 @@ def save_navigation_settings(fields: dict[str, list[str]]) -> AppConfig:
             if "browse_return_seconds" in fields
             else config.browse_return_seconds
         ),
-        screen_saver_idle_seconds=(
-            valid_screen_saver_idle_seconds(one(fields, "screen_saver_idle_seconds"))
-            if "screen_saver_idle_seconds" in fields
-            else config.screen_saver_idle_seconds
-        ),
         root_menu_order=order,
         root_menu_enabled=enabled,
     )
@@ -2378,7 +2553,13 @@ def save_playback_speed_setting(speed: object) -> AppConfig:
     return updated
 
 
-def save_screen_saver_setting(mode: str, dim_percent: int | None = None) -> AppConfig:
+def save_screen_saver_setting(
+    mode: str,
+    dim_percent: int | None = None,
+    *,
+    power_save_enabled: bool | None = None,
+    idle_seconds: float | None = None,
+) -> AppConfig:
     config = load_config()
     updated = replace(
         config,
@@ -2387,6 +2568,14 @@ def save_screen_saver_setting(mode: str, dim_percent: int | None = None) -> AppC
             config.screen_saver_dim_percent
             if dim_percent is None
             else valid_screen_saver_dim_percent(dim_percent)
+        ),
+        power_save_enabled=(
+            config.power_save_enabled if power_save_enabled is None else power_save_enabled
+        ),
+        screen_saver_idle_seconds=(
+            config.screen_saver_idle_seconds
+            if idle_seconds is None
+            else valid_screen_saver_idle_seconds(idle_seconds)
         ),
     )
     save_config(updated)
@@ -2529,6 +2718,7 @@ def render_remote_control_panel(csrf_token: str = "") -> str:
         <button type="button" data-browse-mode="author">Authors</button>
         <button class="secondary" type="button" data-library-refresh>Refresh library</button>
       </div>
+      <p class="hint" data-library-refresh-status aria-live="polite"></p>
       <div class="remote-toolbar" data-group-back-row hidden>
         <button class="secondary" type="button" data-back-groups>Back to groups</button>
       </div>
@@ -2671,178 +2861,153 @@ def render_root_menu_rows(config: AppConfig) -> str:
 
 def render_settings_card(config: AppConfig, csrf_token: str = "") -> str:
     csrf_input = render_csrf_input(csrf_token)
-    enabled = config.control_click_enabled
-    next_value = "0" if enabled else "1"
-    toggle_class = " is-on" if enabled else ""
-    aria_pressed = "true" if enabled else "false"
-    button_label = "Disable control knob click sound" if enabled else "Enable control knob click sound"
-    spoken_navigation_enabled = config.spoken_navigation_enabled
-    spoken_navigation_next_value = "0" if spoken_navigation_enabled else "1"
-    spoken_navigation_toggle_class = " is-on" if spoken_navigation_enabled else ""
-    spoken_navigation_aria_pressed = "true" if spoken_navigation_enabled else "false"
-    spoken_navigation_button_label = (
-        "Disable spoken navigation" if spoken_navigation_enabled else "Enable spoken navigation"
-    )
-    sleep_enabled = config.sleep_timer_enabled
-    sleep_next_value = "0" if sleep_enabled else "1"
-    sleep_toggle_class = " is-on" if sleep_enabled else ""
-    sleep_aria_pressed = "true" if sleep_enabled else "false"
-    sleep_button_label = "Disable sleep timer" if sleep_enabled else "Enable sleep timer"
-    sleep_duration_controls = ""
-    if sleep_enabled:
-        sleep_duration_controls = """
-          <form class="sleep-timer-duration-form" method="post" action="/settings/sleep">
-            {csrf_input}
-            <span>Ask after</span>
-            <input class="settings-number" name="minutes" type="number" min="{sleep_min}" max="{sleep_max}" step="1" value="{sleep_minutes}" aria-label="Sleep timer minutes">
-            <span>minutes of listening</span>
-            <button class="small-button secondary" type="submit">Save</button>
-          </form>
-        """.format(
-            sleep_minutes=config.sleep_timer_minutes,
-            sleep_min=MIN_SLEEP_TIMER_MINUTES,
-            sleep_max=MAX_SLEEP_TIMER_MINUTES,
-            csrf_input=csrf_input,
-        )
     return """
     <section class="card" aria-labelledby="settings-heading">
       <h2 id="settings-heading">Settings</h2>
-      <div class="settings-list">
-        <div class="settings-row">
-          <div>
-            <div class="setting-name">Control knob click sound</div>
+      <p class="hint">Adjust preferences below, then save once to apply all changes.</p>
+      <form class="settings-form" method="post" action="/settings">
+        {csrf_input}
+        <section class="settings-section">
+          <h3>Playback and sound</h3>
+          <div class="settings-grid">
+            <div class="setting-option-row">
+              <div class="setting-option-copy">
+                <div class="setting-option-name">Control knob click sound</div>
+                <span class="hint">Play a short sound when selecting items.</span>
+              </div>
+              <label class="setting-switch" aria-label="Control knob click sound">
+                <input type="checkbox" name="control_click_enabled" value="true"{control_click_checked}>
+                <span aria-hidden="true"></span>
+              </label>
+            </div>
+            <div class="setting-option-row">
+              <div class="setting-option-copy">
+                <div class="setting-option-name">Spoken navigation</div>
+                <span class="hint">Read selected titles and controls aloud.</span>
+              </div>
+              <label class="setting-switch" aria-label="Spoken navigation">
+                <input type="checkbox" name="spoken_navigation_enabled" value="true"{spoken_navigation_checked}>
+                <span aria-hidden="true"></span>
+              </label>
+            </div>
+            <label class="settings-field">Playback speed
+              <select class="settings-select" name="playback_speed" aria-label="Playback speed">
+                {playback_speed_options}
+              </select>
+            </label>
+            <label class="settings-field">Library order
+              <select class="settings-select" name="library_sort_mode" aria-label="Library order">
+                {library_sort_options}
+              </select>
+            </label>
+            <div class="setting-option-row">
+              <div class="setting-option-copy">
+                <div class="setting-option-name">Sleep timer</div>
+                <span class="hint">Pause playback after the selected listening time.</span>
+              </div>
+              <label class="setting-switch" aria-label="Sleep timer enabled">
+                <input type="checkbox" name="sleep_timer_enabled" value="true"{sleep_timer_checked}>
+                <span aria-hidden="true"></span>
+              </label>
+            </div>
+            <label class="settings-field">Sleep after (minutes)
+              <input class="settings-number" name="sleep_timer_minutes" type="number" min="{sleep_min}" max="{sleep_max}" step="1" value="{sleep_minutes}">
+            </label>
           </div>
-          <form class="toggle-form" method="post" action="/settings/click">
-            {csrf_input}
-            <input type="hidden" name="enabled" value="{next_value}">
-            <button class="toggle-button{toggle_class}" type="submit" aria-pressed="{aria_pressed}">
-              <span class="sr-only">{button_label}</span>
-            </button>
-          </form>
-        </div>
-        <div class="settings-row">
-          <div>
-            <div class="setting-name">Spoken navigation</div>
-          </div>
-          <form class="toggle-form" method="post" action="/settings/spoken-navigation">
-            {csrf_input}
-            <input type="hidden" name="enabled" value="{spoken_navigation_next_value}">
-            <button class="toggle-button{spoken_navigation_toggle_class}" type="submit" aria-pressed="{spoken_navigation_aria_pressed}">
-              <span class="sr-only">{spoken_navigation_button_label}</span>
-            </button>
-          </form>
-        </div>
-        <div class="settings-row">
-          <div>
-            <div class="setting-name">Playback speed</div>
-          </div>
-          <form class="select-form" method="post" action="/settings/playback-speed">
-            {csrf_input}
-            <select class="settings-select" name="playback_speed" aria-label="Playback speed">
-              {playback_speed_options}
-            </select>
-            <button class="small-button secondary" type="submit">Save</button>
-          </form>
-        </div>
-        <div class="settings-row screen-saver-row">
-          <div>
-            <div class="setting-name">Screen saver</div>
-          </div>
-          <form class="screen-saver-settings-form" method="post" action="/settings/screensaver">
-            {csrf_input}
-            <label>
-              Style
+        </section>
+
+        <section class="settings-section">
+          <h3>Screen saver and power</h3>
+          <div class="settings-grid">
+            <label class="settings-field">Screen saver style
               <select class="settings-select" name="screen_saver_mode" aria-label="Screen saver style">
                 {screen_saver_options}
               </select>
             </label>
-            <label>
-              Dim level
+            <label class="settings-field">Dim level (animated styles)
               <select class="settings-select" name="screen_saver_dim_percent" aria-label="Screen saver dim level">
                 {screen_saver_dim_options}
               </select>
             </label>
-            <button class="small-button secondary" type="submit">Save</button>
-          </form>
-        </div>
-        <div class="settings-row">
-          <div class="sleep-timer-content">
-            <div class="setting-name">Sleep timer</div>
-            {sleep_duration_controls}
+            <label class="settings-field">Idle timeout (minutes; 0 disables)
+              <input class="settings-number" name="screen_saver_idle_minutes" type="number" min="0" max="60" step="0.5" value="{screen_saver_idle_minutes}">
+              <span class="hint">Shared by the screen saver and Power Save Mode.</span>
+            </label>
+            <div class="setting-option-row setting-option-wide">
+              <div class="setting-option-copy">
+                <div class="setting-option-name">Power Save Mode</div>
+                <span class="hint">When playback is stopped, the timeout turns off the OLED and Wi-Fi and makes the portal unavailable. Turning either knob wakes the player. Audio is muted; current wiring does not cut amplifier power.</span>
+              </div>
+              <label class="setting-switch" aria-label="Power Save Mode">
+                <input type="checkbox" name="power_save_enabled" value="true"{power_save_checked}>
+                <span aria-hidden="true"></span>
+              </label>
+            </div>
           </div>
-          <form class="toggle-form" method="post" action="/settings/sleep">
-            {csrf_input}
-            <input type="hidden" name="enabled" value="{sleep_next_value}">
-            <button class="toggle-button{sleep_toggle_class}" type="submit" aria-pressed="{sleep_aria_pressed}">
-              <span class="sr-only">{sleep_button_label}</span>
-            </button>
-          </form>
-        </div>
-      </div>
-      <div class="navigation-settings-card">
-        <h3>Navigation and display</h3>
-        <p class="hint">Navigation and display changes take effect while the player is running. The startup choice applies next time it starts.</p>
-        <form class="navigation-settings-form" method="post" action="/settings/navigation">
-          {csrf_input}
+        </section>
+
+        <section class="settings-section">
+          <h3>Navigation and display</h3>
+          <p class="section-hint">Changes take effect while the player is running. The startup choice applies next time it starts.</p>
           <div class="nav-settings-grid">
-            <label>Knob hold (seconds)
+            <label class="settings-field">Knob hold (seconds)
               <input class="settings-number" name="knob_hold_seconds" type="number" min="0.5" max="5" step="0.1" value="{knob_hold_seconds}">
               <span class="hint">Applies to individual knob holds and the two-knob shutdown gesture.</span>
             </label>
-            <label>Marquee start delay (seconds)
+            <label class="settings-field">Marquee start delay (seconds)
               <input class="settings-number" name="marquee_delay_seconds" type="number" min="0" max="5" step="0.05" value="{marquee_delay_seconds}">
             </label>
-            <label>Marquee speed (pixels/second)
+            <label class="settings-field">Marquee speed (pixels/second)
               <input class="settings-number" name="marquee_speed_px_per_second" type="number" min="8" max="120" step="1" value="{marquee_speed}">
             </label>
-            <label>Pause between marquee loops (seconds)
+            <label class="settings-field">Pause between marquee loops (seconds)
               <input class="settings-number" name="marquee_loop_pause_seconds" type="number" min="0" max="10" step="0.1" value="{marquee_loop_pause_seconds}">
             </label>
-            <label>Knob acceleration multiplier
+            <label class="settings-field">Knob acceleration
               <select class="settings-select" name="navigation_acceleration_mode">{acceleration_options}</select>
             </label>
-            <label>Fast-turn threshold (milliseconds)
+            <label class="settings-field">Fast-turn threshold (milliseconds)
               <input class="settings-number" name="navigation_accel_threshold_milliseconds" type="number" min="10" max="500" step="5" value="{accel_threshold_ms}">
-              <span class="hint">Acceleration applies when the time between knob steps is at or below this value. Lower values require a faster turn.</span>
+              <span class="hint">Lower values require a faster turn.</span>
             </label>
-            <label>Return to playback after browsing (seconds; 0 disables)
+            <label class="settings-field">Return to playback after browsing (seconds; 0 disables)
               <input class="settings-number" name="browse_return_seconds" type="number" min="0" max="120" step="1" value="{browse_return_seconds}">
             </label>
-            <label>Screen saver idle time (seconds; 0 disables)
-              <input class="settings-number" name="screen_saver_idle_seconds" type="number" min="0" max="3600" step="30" value="{screen_saver_idle_seconds}">
+          </div>
+          <div class="setting-option-row startup-resume-setting">
+            <div class="setting-option-copy">
+              <div class="setting-option-name">Resume your latest in-progress book at startup</div>
+              <span class="hint">Uses your Audiobookshelf account’s listening progress. When off, startup opens the first root-menu item.</span>
+            </div>
+            <label class="setting-switch" aria-label="Resume latest in-progress book at startup">
+              <input type="checkbox" name="startup_resume_last_played" value="true"{startup_resume_checked}>
+              <span aria-hidden="true"></span>
             </label>
           </div>
-          <label class="root-menu-enabled startup-resume-setting">
-            <input type="checkbox" name="startup_resume_last_played" value="true"{startup_resume_checked}>
-            <span>Open your latest in-progress book at startup</span>
-          </label>
-          <p class="hint">Uses your Audiobookshelf account’s listening progress. When off, startup selects the first item in the root menu.</p>
           <fieldset class="root-menu-settings">
             <legend>Root menu choices and order</legend>
             <div class="root-menu-list">{root_menu_rows}</div>
             <p class="hint">Choose which sections appear and their order. At least one stays enabled.</p>
           </fieldset>
-          <button class="small-button secondary" type="submit">Save navigation settings</button>
-        </form>
-      </div>
+        </section>
+        <div class="settings-save-row">
+          <button class="secondary" type="submit">Save all settings</button>
+        </div>
+      </form>
     </section>
     """.format(
-        next_value=next_value,
-        toggle_class=toggle_class,
-        aria_pressed=aria_pressed,
-        button_label=button_label,
-        spoken_navigation_next_value=spoken_navigation_next_value,
-        spoken_navigation_toggle_class=spoken_navigation_toggle_class,
-        spoken_navigation_aria_pressed=spoken_navigation_aria_pressed,
-        spoken_navigation_button_label=spoken_navigation_button_label,
+        control_click_checked=" checked" if config.control_click_enabled else "",
+        spoken_navigation_checked=" checked" if config.spoken_navigation_enabled else "",
+        sleep_timer_checked=" checked" if config.sleep_timer_enabled else "",
+        sleep_minutes=config.sleep_timer_minutes,
+        sleep_min=MIN_SLEEP_TIMER_MINUTES,
+        sleep_max=MAX_SLEEP_TIMER_MINUTES,
         playback_speed_options=render_playback_speed_options(config.playback_speed),
+        library_sort_options=render_library_sort_options(config.library_sort_mode),
         screen_saver_options=render_screen_saver_options(config.screen_saver_mode),
         screen_saver_dim_options=render_screen_saver_dim_options(config.screen_saver_dim_percent),
-        sleep_next_value=sleep_next_value,
-        sleep_toggle_class=sleep_toggle_class,
-        sleep_aria_pressed=sleep_aria_pressed,
-        sleep_button_label=sleep_button_label,
-        sleep_duration_controls=sleep_duration_controls,
+        screen_saver_idle_minutes=f"{config.screen_saver_idle_seconds / 60:g}",
+        power_save_checked=" checked" if config.power_save_enabled else "",
         knob_hold_seconds=config.knob_hold_seconds,
         marquee_delay_seconds=config.marquee_delay_seconds,
         marquee_speed=config.marquee_speed_px_per_second,
@@ -2850,7 +3015,6 @@ def render_settings_card(config: AppConfig, csrf_token: str = "") -> str:
         acceleration_options=render_acceleration_options(config.navigation_acceleration_mode),
         accel_threshold_ms=config.navigation_accel_threshold_milliseconds,
         browse_return_seconds=config.browse_return_seconds,
-        screen_saver_idle_seconds=config.screen_saver_idle_seconds,
         startup_resume_checked=" checked" if config.startup_resume_last_played else "",
         root_menu_rows=render_root_menu_rows(config),
         csrf_input=csrf_input,
@@ -2910,6 +3074,7 @@ def render_screen_saver_options(selected_mode: str) -> str:
         (SCREEN_SAVER_CHAPTER, "Chapter word"),
         (SCREEN_SAVER_BOOKS, "Book titles"),
         (SCREEN_SAVER_CLOCK, "Digital clock"),
+        (SCREEN_SAVER_OFF, "Turn display off (low power)"),
     )
     return "\n".join(
         '<option value="{value}"{selected}>{label}</option>'.format(

@@ -100,7 +100,7 @@ For a package-style quick start card, open the [PDF](docs/first-boot-quick-start
 
 The setup page includes live Wi-Fi, Audiobookshelf, Bluetooth, and playback status. Its Remote Control tab can search and browse the library, start or resume a book, control playback and volume, skip chapters, manage Bluetooth audio, and review books played on this device. Device history is stored on the Chapter player and is separate from Audiobookshelf account history.
 
-Settings include playback speed, library sorting, spoken navigation, click feedback, screen saver style and dimming, sleep timer, startup behavior, and navigation behavior. Navigation settings include root-menu visibility and order; the shared knob-hold duration; title-marquee start delay, speed, and loop pause; knob-acceleration multiplier and speed threshold; and the delay before returning to playback.
+The Settings tab groups playback, display, and navigation preferences into one form with one save action. It includes playback speed, library sorting, spoken navigation, click feedback, screen saver style and dimming, optional Power Save Mode, and one shared idle timeout entered in minutes. Power Save Mode can switch off the OLED and Wi-Fi, stop the setup portal proxy, and mute audio while keeping the Pi awake to monitor the knobs; turning either knob restores the display and network services. The current amplifier wiring supports software mute but not physically cutting amplifier power. Other settings include the sleep timer, startup behavior, and navigation behavior. Navigation settings include root-menu visibility and order; the shared knob-hold duration; title-marquee start delay, speed, and loop pause; knob-acceleration multiplier and speed threshold; and the delay before returning to playback.
 
 By default, startup opens `Continue Listening`. An optional setting shows a resume prompt for the user's most recently updated in-progress book at startup. The built-in update checker follows stable releases from the upstream `chrismtopher/chapter` repository; it does not install this fork's untagged `main` commits. See [working with this fork](docs/fork-development.md) for the fork's SSH deployment process.
 
@@ -116,7 +116,7 @@ By default, startup opens `Continue Listening`. An optional setting shows a resu
 - Audiobookshelf login through the local setup page
 - Searchable web remote control for books, playback, chapters, volume, and Bluetooth
 - Recent-playback history stored on the device, separate from account-wide history
-- Configurable `1x`, `1.5x`, and `2x` playback speed
+- Configurable `1x`, `1.25x`, `1.5x`, and `2x` playback speed
 - Configurable library ordering by title or author last name
 - Configurable startup selection, screen saver, sleep timer, marquee, knob holds, and navigation
 - Optional offline spoken navigation for book titles and controls using a tuned eSpeak NG voice

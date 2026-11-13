@@ -12,7 +12,7 @@ from .storage import ensure_storage_directory, finalize_storage_file
 
 
 LIBRARY_CACHE_PATH = Path.home() / ".local" / "state" / "abs-kids-player" / "library-cache.json"
-LIBRARY_CACHE_VERSION = 1
+LIBRARY_CACHE_VERSION = 2
 
 
 def load_cached_books(config: AppConfig) -> list[Book]:
